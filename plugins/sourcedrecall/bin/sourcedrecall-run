@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Launcher for the sourcedrecall Claude Code plugin.
+#
+#   sourcedrecall-run mcp                  start the MCP server
+#   sourcedrecall-run hook session-start   SessionStart hook
+#   sourcedrecall-run hook session-end     SessionEnd hook
+#   sourcedrecall-run install              install or update now (foreground)
+#   sourcedrecall-run memory|import|setup  the sourcedrecall-memory, -import and
+#                                          -setup commands from the plugin's own
+#                                          environment (in Claude Code:
+#                                          `! sourcedrecall-run memory show`)
+#
+# Claude Code installs only Node dependencies for plugins, so this script
+# installs the Python side itself, into the plugin's data directory
+# (${CLAUDE_PLUGIN_DATA}, which survives plugin updates): a shallow clone of
+# the source at a pinned tag, a venv, the server
+# package, and the models (sourcedrecall-setup). The first session starts the
+# install in the background; until it is done the MCP server is a stand-in
+# (bin/setup_server.py) that hands over to the real one when it is ready.
+# An install is redone when the plugin version changes.
+set -u
+
+REPO_URL="${SOURCEDRECALL_REPO_URL:-https://github.com/synthiumjp/sourcedrecall.git}"   # a fork or mirror
+ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# 2026-11-11 (review): Claude Code sets this for hooks and the MCP server but
+# not for `! sourcedrecall-run ...`, so the commands' hints named
+# `sourcedrecall-memory ...`, which is not on a plugin user's PATH
+export CLAUDE_PLUGIN_ROOT="$ROOT"
+STATE="${SOURCEDRECALL_STATE:-$HOME/.sourcedrecall}"
+# 2026-10-21 (review): Claude Code sets CLAUDE_PLUGIN_DATA for hooks and the
+# MCP server but not in its shell, so `sourcedrecall-run memory ...` (and the
+# `install` retry the failure message suggests) used another folder. Each
+# hook run records the folder; a run without the variable reads it back.
+if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  DATA="$CLAUDE_PLUGIN_DATA"
+  if [ "$(cat "$STATE/plugin-data" 2>/dev/null)" != "$DATA" ]; then
+    mkdir -p "$STATE" 2>/dev/null && chmod 700 "$STATE" 2>/dev/null
+    printf '%s\n' "$DATA" > "$STATE/plugin-data" 2>/dev/null
+  fi
+else
+  DATA="$(cat "$STATE/plugin-data" 2>/dev/null)"
+  [ -n "$DATA" ] && [ -d "$DATA" ] || DATA="$HOME/.sourcedrecall/plugin"
+fi
+VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$ROOT/.claude-plugin/plugin.json" | head -1)"
+REF="${SOURCEDRECALL_REF:-sourcedrecall-v$VERSION}"
+SRC="$DATA/src"
+VENV="$DATA/venv"
+# 2026-10-05: native Windows runs this script in Git Bash; a venv there keeps
+# its programs in Scripts\ with .exe (untested on Windows so far)
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) VBIN="$VENV/Scripts"; EXE=".exe" ;;
+  *) VBIN="$VENV/bin"; EXE="" ;;
+esac
+STAMP="$DATA/installed"
+LOG="$DATA/install.log"
+LOCK="$DATA/install.lock"
+OWNER="${SOURCEDRECALL_OWNER:-${CLAUDE_PLUGIN_OPTION_OWNER:-}}"
+export SOURCEDRECALL_OWNER="$OWNER"
+case "${CLAUDE_PLUGIN_OPTION_BRIEFING:-true}" in
+  false|0|off|no) export SOURCEDRECALL_BRIEFING=off ;;
+esac
+# 2026-10-07: optional notes model (small | standard); anything else is off,
+# which also keeps an installed model from being used
+NOTES="$(printf '%s' "${SOURCEDRECALL_NOTES_TIER:-${CLAUDE_PLUGIN_OPTION_NOTES:-off}}" | tr '[:upper:]' '[:lower:]')"
+case "$NOTES" in
+  small|standard) ;;
+  *) NOTES=off; export SOURCEDRECALL_NOTES=off ;;
+esac
+# Before anything redirects into it: `install` on a fresh machine failed
+# here because the log's directory did not exist yet.
+mkdir -p "$DATA" || { echo "sourcedrecall: cannot create $DATA" >&2; exit 1; }
+
+# 2026-10-21 (review): a failed install stayed failed: nothing retried it,
+# not even a plugin update. The mark now names the version it was for and
+# lasts an hour; after that, or for another version, the install runs again.
+if [ -f "$DATA/install.failed" ] && { [ "$(head -1 "$DATA/install.failed")" != "$REF" ] ||
+     [ -n "$(find "$DATA/install.failed" -mmin +60 2>/dev/null)" ]; }; then
+  rm -f "$DATA/install.failed"
+fi
+
+installed() {
+  [ -x "$VBIN/sourcedrecall$EXE" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$REF" ]
+}
+
+notes_ready() {
+  [ "$NOTES" = off ] || [ "$(cat "$DATA/notes-installed" 2>/dev/null)" = "$REF $NOTES" ]
+}
+
+find_python() {   # prints a Python 3.10-3.13, or fails
+  local py="" c v
+  # PATH first, then where Homebrew and python.org put Python: an app started
+  # from the macOS desktop (or a non-login shell) often has only Apple's 3.9
+  # on PATH even when a newer Python is installed.
+  for c in python3.13 python3.12 python3.11 python3.10 python3 python; do
+    c="$(command -v "$c")" || continue
+    # 2026-10-12 (review 4.5): 3.14 untested (some dependencies build from
+    # source there)
+    if "$c" -c 'import sys; sys.exit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)'; then
+      py="$c"; break
+    fi
+  done
+  if [ -z "$py" ] && command -v py >/dev/null; then
+    # the Windows Python launcher: ask it where a recent Python lives
+    for v in 3.13 3.12 3.11 3.10; do
+      c="$(py -$v -c 'import sys; print(sys.executable)' 2>/dev/null)" && [ -n "$c" ] && { py="$c"; break; }
+    done
+  fi
+  if [ -z "$py" ]; then
+    for v in 3.13 3.12 3.11 3.10; do
+      for c in "/opt/homebrew/bin/python$v" "/usr/local/bin/python$v" \
+               "/Library/Frameworks/Python.framework/Versions/$v/bin/python$v"; do
+        [ -x "$c" ] && { py="$c"; break 2; }
+      done
+    done
+  fi
+  [ -n "$py" ] && printf '%s\n' "$py"
+}
+
+do_install() {
+  mkdir -p "$DATA"
+  echo "== sourcedrecall install $REF $(date)"
+  if installed; then          # only the notes model is missing
+    do_notes || return 1
+    echo "== done $(date)"
+    return 0
+  fi
+  command -v git >/dev/null || { echo "git is required"; return 1; }
+  local py
+  py="$(find_python)" || { echo "Python 3.10 to 3.13 is required (macOS: brew install python@3.12; Windows: python.org or winget install Python.Python.3.12)"; return 1; }
+  echo "using $py"
+  if [ -d "$SRC/.git" ]; then
+    git -C "$SRC" fetch --depth 1 origin "refs/tags/$REF:refs/tags/$REF" 2>/dev/null ||
+      git -C "$SRC" fetch --depth 1 origin "$REF" || return 1
+    git -C "$SRC" checkout -q "$REF" 2>/dev/null || git -C "$SRC" checkout -q FETCH_HEAD || return 1
+  else
+    git clone -q --depth 1 --branch "$REF" "$REPO_URL" "$SRC" || return 1
+  fi
+  # 2026-10-21 (review): Debian and Ubuntu leave a venv without pip when
+  # python3-venv is missing, and the next try then skipped making it
+  if [ -x "$VBIN/python$EXE" ] && ! "$VBIN/python$EXE" -m pip --version >/dev/null 2>&1; then
+    rm -rf "$VENV"
+  fi
+  if [ ! -x "$VBIN/python$EXE" ]; then
+    "$py" -m venv "$VENV" && "$VBIN/python$EXE" -m pip --version >/dev/null 2>&1 || {
+      rm -rf "$VENV"
+      echo "could not make a Python environment with $py."
+      echo "On Debian or Ubuntu: sudo apt install python3-venv (or python3.X-venv for your version)"
+      return 1
+    }
+  fi
+  "$VBIN/python$EXE" -m pip install -q --upgrade pip || return 1
+  pip_server "$SRC/server" || return 1
+  "$VBIN/sourcedrecall-setup$EXE" || return 1
+  echo "$REF" > "$STAMP"
+  do_notes || return 1
+  echo "== done $(date)"
+}
+
+# 2026-10-29 (review M7): the versions a fresh install was tested with, and
+# the newest pyproject.toml allows where one of them does not install here
+pip_server() {
+  local c="$SRC/server/constraints.txt"
+  if [ -f "$c" ] && "$VBIN/python$EXE" -m pip install -q -c "$c" -e "$1"; then
+    return 0
+  fi
+  [ -f "$c" ] && echo "the tested versions did not all install here; using the newest allowed"
+  "$VBIN/python$EXE" -m pip install -q -e "$1"
+}
+
+do_notes() {
+  notes_ready && return 0
+  pip_server "$SRC/server[notes]" || return 1
+  "$VBIN/sourcedrecall-setup$EXE" --notes "$NOTES" || return 1
+  echo "$REF $NOTES" > "$DATA/notes-installed"
+}
+
+# 2026-10-12 (review 4.3): the user saw only a failing MCP server; the
+# messages below go to the user (systemMessage), not only to the model
+json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+tell_user() {   # $1 = message for the user, $2 = line for the model (optional)
+  local m c
+  m="$(json_str "$1")"
+  if [ -n "${2:-}" ]; then
+    c="$(json_str "$2")"
+    printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$m" "$c"
+  else
+    printf '{"systemMessage":"%s"}\n' "$m"
+  fi
+}
+
+start_background_install() {
+  mkdir -p "$DATA"
+  # a lock left by an install that died (reboot, kill) expires after an hour
+  if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+    rmdir "$LOCK" 2>/dev/null
+  fi
+  mkdir "$LOCK" 2>/dev/null || return 1      # already installing
+  nohup bash -c '"$0" install; rmdir "$1" 2>/dev/null' "$0" "$LOCK" \
+    </dev/null >/dev/null 2>&1 &
+  return 0
+}
+
+case "${1:-}" in
+  install)
+    do_install >>"$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 0 ]; then
+      rm -f "$DATA/install.failed"
+    else
+      { echo "$REF"; date; } > "$DATA/install.failed"
+      echo "sourcedrecall: install failed, see $LOG" >&2
+    fi
+    exit $rc
+    ;;
+  mcp)
+    if ! installed; then
+      # 2026-10-14: a stand-in server answers until the install is done, then
+      # hands over, so the tools appear in this session; exiting here made
+      # Claude Code cache the failure for the whole session
+      [ -f "$DATA/install.failed" ] || start_background_install
+      if py="$(find_python)"; then
+        exec "$py" "$ROOT/bin/setup_server.py" "$VBIN/sourcedrecall$EXE" "$STAMP" "$REF" \
+          "$LOG" "$DATA/install.failed" "$LOCK"
+      fi
+      echo "sourcedrecall: still setting up (a few minutes, the first time only). The memory" \
+           "tools are available from your next Claude Code session. Progress: $LOG" >&2
+      exit 1
+    fi
+    exec "$VBIN/sourcedrecall$EXE"
+    ;;
+  hook)
+    event="${2:-}"
+    if ! installed; then
+      if [ "$event" = "session-start" ]; then
+        if [ -f "$DATA/install.failed" ] && [ ! -d "$LOCK" ]; then
+          tell_user "sourcedrecall: the install failed. The reason is at the end of $LOG. It is tried again in an hour, or now with: ! sourcedrecall-run install"
+        elif start_background_install || [ -d "$LOCK" ]; then
+          tell_user "sourcedrecall: setting up local memory in the background (about 0.7 GB of models, a few minutes, the first time only). The memory tools appear in this session when it is done, and this session will be remembered." \
+                    "[sourcedrecall] Installing local memory (first run). This session will be remembered once the install finishes."
+        fi
+      fi
+      if [ "$event" = "session-end" ]; then
+        # 2026-10-04: a session that ends before the install has finished is
+        # queued (its transcript stays on disk) and stored afterwards; the
+        # first session used to be lost
+        { tr -d '\n' ; echo; } >> "$DATA/pending.jsonl"
+      fi
+      exit 0
+    fi
+    if [ -z "$OWNER" ]; then
+      echo "sourcedrecall: set your name with /plugin configure sourcedrecall" >&2
+      [ "$event" = "session-start" ] && tell_user "sourcedrecall needs your name to tell your words from other people's: /plugin configure sourcedrecall. Sessions are kept until then." 
+      [ "$event" = "session-end" ] && { tr -d '\n' ; echo; } >> "$DATA/pending.jsonl"
+      exit 0
+    fi
+    # notes chosen but not installed yet: install them in the background;
+    # memory works meanwhile, without notes
+    if [ "$event" = "session-start" ] && ! notes_ready; then
+      start_background_install
+    fi
+    if [ "$event" = "session-start" ] && [ -s "$DATA/pending.jsonl" ]; then
+      queued="$DATA/pending-$$.jsonl"
+      mv "$DATA/pending.jsonl" "$queued" 2>/dev/null &&
+        nohup "$VBIN/sourcedrecall-hook$EXE" _pending "$queued" --owner "$OWNER" \
+          </dev/null >>"$DATA/pending.log" 2>&1 &
+    fi
+    exec "$VBIN/sourcedrecall-hook$EXE" "$event" --owner "$OWNER"
+    ;;
+  memory|import|setup)
+    if [ ! -x "$VBIN/sourcedrecall-$1$EXE" ]; then
+      echo "sourcedrecall is not installed yet (it installs in the background in your first Claude Code session). Progress: $LOG" >&2
+      exit 1
+    fi
+    cmd="$1"; shift
+    exec "$VBIN/sourcedrecall-$cmd$EXE" "$@"
+    ;;
+  *)
+    echo "usage: sourcedrecall-run memory|import|setup ... | install | mcp | hook session-start|session-end" >&2
+    exit 2
+    ;;
+esac

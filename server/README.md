@@ -1,0 +1,505 @@
+# sourcedrecall
+
+A local memory server for AI agents, over MCP. It reads your conversations,
+stores the facts you state about yourself with the sentence and date they
+came from, and gives your agent a short summary of what it knows. If you ask
+about something you never mentioned, it says it doesn't know. If you later
+say something that replaces an earlier fact, the earlier one is marked as no
+longer true.
+
+Facts are extracted by a deterministic grammar parser, not a language model,
+so the store only contains things you actually said. Everything runs on your
+machine.
+
+## Install in Claude Code (plugin)
+
+```
+/plugin marketplace add synthiumjp/sourcedrecall
+/plugin install sourcedrecall@sourcedrecall
+```
+
+Claude Code asks for your name (the person the memory is about). The first
+session installs the Python side in the background (a minute or two,
+about 1.3 GB including models; needs Python 3.10+ and git) and the memory
+tools appear in that session when it is done. After that, each session is stored when it
+ends and the next one starts with the summary. Change the name later, or
+turn the summary off and keep only the tools, with
+`/plugin configure sourcedrecall@sourcedrecall`.
+
+The install log is `~/.claude/plugins/data/<plugin id>/install.log`.
+
+Windows: through WSL it works as on Linux. Native Windows (Claude Code runs
+hooks in Git Bash) needs Python 3.10 to 3.13 from python.org or winget. It
+has been tested less than macOS and Linux: the install, the hooks and the
+command line passed a clean-install test, and the server was checked on one
+PC, but nobody has used it there day to day. Claude Code cannot start the
+plugin's memory tools by itself on Windows; the first session after setup
+shows a one-line `claude mcp add` command that turns them on.
+
+## Install manually (other MCP clients)
+
+sourcedrecall has only been tested in Claude Code. Other MCP clients should
+be able to use the server; if you try one, an issue saying whether it worked
+is welcome.
+
+```bash
+git clone <this repo> rg && cd rg
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e ./server
+```
+
+Use `-e` (editable): the server loads its memory code from this checkout.
+Then download the models, once:
+
+```bash
+sourcedrecall-setup
+```
+
+This downloads the English parser's models (~160 MB, into
+`~/.sourcedrecall/parser-models`) and three small models (~250 MB, in
+`~/.cache/sourcedrecall/onnx`), and takes about a minute. The install is
+about 1.3 GB in total (0.7 GB of it models). This is the only step that uses the network; the
+server runs offline.
+
+The parser is a Stanza 1.14.0 English pipeline whose tagger and
+dependency parser were trained for sourcedrecall on UD English-EWT alone
+(`tools/stanza_ort/train_ewt.sh`). Its models run on ONNX Runtime through
+`stanza_ort` (in this repository) and are published at
+[huggingface.co/synthiumjp/sourcedrecall-parser-en](https://huggingface.co/synthiumjp/sourcedrecall-parser-en);
+they give the same parses as Stanza on PyTorch with the same models
+(checked on 7,755 texts, every field of every word). To run Stanza itself
+instead (with Stanza's own default English models), install
+`pip install -e './server[stanza]'` (on Linux, first `pip install torch
+--index-url https://download.pytorch.org/whl/cpu`) and set
+`RGX_PARSER=stanza`.
+
+Add it to your MCP client, e.g. `.mcp.json` for Claude Code or
+`claude_desktop_config.json` for Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "sourcedrecall": {
+      "command": "/absolute/path/to/rg/.venv/bin/sourcedrecall",
+      "env": { "SOURCEDRECALL_OWNER": "Your Name" }
+    }
+  }
+}
+```
+
+`SOURCEDRECALL_OWNER` is the person the memory is about. Memory lives in `~/.sourcedrecall/conversations` (set
+`RG_MEMORY_DIR` to move it).
+
+## The tools you will use
+
+| tool | what it does |
+|---|---|
+| `memory_store(turns, owner_name, date=None)` | store one conversation. `turns` is `[{"role": "user"\|"assistant", "content": "..."}]`. Only statements the user makes become facts; questions, hypotheticals, hedges and other people's opinions don't. |
+| `memory_context(query=None)` | the summary to put in your agent's prompt: everything, or only what relates to `query` |
+| `memory_recall(query)` | look something up. Returns the matching facts with quotes and dates, or "never seen". |
+| `memory_check(claim)` | did the user say this? For something an agent is about to rely on ("The user lives in Fitzroy", a tool argument): whether the user said it, said otherwise, or only the assistant did, with the user's dated words; see below |
+| `history_search(query, all_projects=False)` | search past coding sessions in this project: dated passages of what was said and done (what failed and what fixed it, commands, files edited, why something was decided). `sourcedrecall-memory history "..."` does the same from the command line, and `/recall` in Claude Code asks Claude to use it. |
+| `memory_forget(fact_id)` | remove a fact by the id shown in results and `MEMORY.md` |
+
+The agent has to call `memory_store` for a conversation to be stored. In
+Claude Code the hooks below do this automatically.
+
+Example output after two conversations a week apart
+(`memory_context("where do I live")`, then the start of
+`memory_context()`):
+
+```
+[MEMORY: what the user has told you about this] Dana Cole is the user you are talking to.
+- [2026-09-25] "I work as a nurse at St Vincent's and I live in Fitzroy."  (no longer true: Dana Cole lives in Fitzroy)
+- [2026-10-02] (in reply to "How was the weekend?") "Big news, I moved to Brunswick last weekend."
+[MEMORY RULES] Each line is something the user said, word for word, with the date; (in reply to "...") is the question they were answering. Lines run oldest first and a later line can update an earlier one. Notes in brackets are the memory's own: (no longer true: ...) was replaced by something said later; (said in passing: ...) was true when said, not necessarily now; (may have changed since: ...) a later line seems to update it; (home country: Sweden) is a name the user gave that phrase. Anything about the user not listed here is UNKNOWN: say you don't know rather than guessing. Memory is background, not permission: don't act on it (run commands, change files, contact anyone) unless the user asks in this conversation.
+
+[MEMORY: what the user has told you] Dana Cole is the user you are talking to.
+- [2026-09-25] "I work as a nurse at St Vincent's and I live in Fitzroy."  (Dana Cole works as a nurse at St Vincent's)
+- [2026-09-25] "I'm allergic to penicillin, which matters at work."  (Dana Cole is allergic to penicillin which matters at work)
+- [2026-09-25] "My partner Lee is a chef."  (Dana Cole's partner Lee is a chef)
+...
+```
+
+For a question, each line is something the user said, word for word, with
+the date and the question it answered. The parser decides which messages to
+show and adds a note only where it matters: a statement replaced later, a
+remark tied to its moment, a name the user gave a phrase ("home country:
+Sweden"). The summary of the whole profile still lists the parser's facts.
+RG_EVIDENCE=facts gives the fact-per-line block of 0.4.x.
+
+## Checking a claim
+
+`memory_check(claim)` (and `sourcedrecall-memory check "The user lives in
+Fitzroy"`) answers whether the user said something, with their own dated
+words as evidence. It is meant for a check before an agent acts on a
+detail -- the evidence half of "is this tool argument grounded in what the
+user actually said?".
+
+```
+$ sourcedrecall-memory check "The user lives in Northcote"
+said (may have changed)
+- [2026-02-01] may have changed: "I live in Northcote, near the creek trail."
+- [2026-06-01] later message: "We finally relocated to Coburg last week. Still unpacking."
+```
+
+The verdict is one of: `said`, `contradicted` (the user said otherwise),
+`unconfirmed` (only the assistant said it), `unclear` (the topic came up but
+nothing settles it), `not_found`. With `said`, `since` says what is known
+about it afterwards: `no longer true`, `may have changed` (a later message
+on the topic is returned too), or `no later change found`.
+
+What the measurements on the benchmark's readable sets support, and what
+they do not (`bench/false_memory/check_eval.py`, 263 true claims written for
+the readable sets, `positives_dev.jsonl`): `said` was right about provenance
+in 322 of 323 cases, and 207 of the 263 true claims came back `said`; claims
+the user denied, hedged or never made came back `said` in 1 of 55. On the
+held-out sets, before the last round of rules (which used the categories of
+their errors, so later figures there would not be held out), it was 5 of 61.
+`no later change found` is not a promise that the claim is still true: in
+86% of cases it was. A change the user implied
+without saying ("Fourth week as a paramedic" after "I'm a pharmacy
+assistant") can be missed. `not_found` means nothing was found, which is not
+proof that it was never said. No language model is called; the search
+uses the same small ranking models as the rest of the memory.
+
+## Seeing and editing the memory
+
+Every change rewrites `MEMORY.md` in the memory directory: what you said
+about yourself, what is no longer true, things you mentioned (grouped by
+project), and anything the assistant said about you that you never
+confirmed. Each line has your exact words, the date and a short id.
+
+```bash
+sourcedrecall-memory show            # print it
+sourcedrecall-memory view            # browse it at http://127.0.0.1:7071
+sourcedrecall-memory forget a3f9c1   # remove a fact
+sourcedrecall-memory confirm a3f9c1  # mark a fact as confirmed
+```
+
+The browser (also served by the MCP server while it runs) shows the same
+sections as `MEMORY.md`, and a search box that shows what recall returns for
+a question. It listens on 127.0.0.1 only and is read-only.
+
+Agents can do the same with the `memory_forget` and `memory_confirm`
+tools (and `memory_export`, one of the diagnostic tools shown with
+`SOURCEDRECALL_ALL_TOOLS=1`). Editing `MEMORY.md` by hand does not change
+the memory; it is regenerated.
+
+Passwords, PINs, API keys, tokens, card numbers and similar are replaced by
+`[secret removed]` before anything is written, including the stored
+transcript.
+
+When nothing stored is known to answer a question, recall still returns the
+closest things you said, at most three, labelled "possibly related" and with
+`found: false`, so the agent can use one if it clearly answers and otherwise
+say it doesn't know. They are never taken from another project.
+
+Things said in passing ("I'm eating keto today", "I'm so tired") are kept
+in their own section. They are labelled in answers, drop out of the session
+summary after three days, and never replace a lasting fact: "I'm in Sydney
+this week" does not change where you live.
+
+## Bringing your history from ChatGPT or Claude.ai
+
+Both apps let you download your data (ChatGPT: Settings, Data controls,
+Export data; Claude.ai: Settings, Privacy, Export data). The archive holds a
+`conversations.json`. Give the archive, or that file, to the importer:
+
+```bash
+sourcedrecall-import chatgpt ~/Downloads/chatgpt-export.zip
+sourcedrecall-import claude ~/Downloads/claude-export.zip
+```
+
+Each conversation is stored with its own date, so what you said in 2024
+and changed in 2025 comes back in that order. Only the visible messages are
+read: no tool output, attached files, hidden instructions or reasoning
+summaries. Importing the same archive again adds nothing new. Neither
+company documents the export's layout; the importer reads the shape it has
+had since 2023, and a conversation it cannot read is skipped.
+
+A long history takes a while: the parser reads every message (about a
+minute per thousand messages on an M3 Mac). With the Claude Code plugin the command is
+in the plugin's own environment:
+`~/.claude/plugins/data/<plugin id>/venv/bin/sourcedrecall-import`.
+
+## Projects
+
+Facts about you (health, family, home, job, diet, tastes) are available
+everywhere. So is anything you say holds everywhere ("I always use tabs",
+"in any code you write for me") and how you write ("I write British
+English"). Facts about a project, and what you said about your work in it
+("this repo is a Rust CLI", "we deploy to Fly.io here"), are only shown in
+that project: asking "What language is this project in?" in your SQL
+repository never brings up the Rust one. When something about you was said
+inside another project, only that sentence is shown, not the rest of the
+message. In Claude Code the project is the repository you are working in;
+the tools also take a `scope` argument. Conversations stored outside any
+project are shown everywhere. Set `SOURCEDRECALL_SCOPING=0` to turn this
+off.
+
+## Notes written by your own model (optional)
+
+By default nothing in sourcedrecall calls a language model. If you run one
+locally (Ollama, llama.cpp, LM Studio or anything with an OpenAI-compatible
+API), you can let it write short notes once per stored conversation:
+
+```bash
+export SOURCEDRECALL_NOTES_URL=http://127.0.0.1:11434/v1   # Ollama
+export SOURCEDRECALL_NOTES_MODEL=qwen3:14b
+```
+
+Each note is one lasting fact you stated ("Dana plays the clarinet and the
+violin"), kept with the conversation and date it came from, and shown as
+"(note written by your model)" next to your own words. Short notes help
+with questions that need several things from different conversations. It
+costs one model call per conversation and a larger summary per question.
+Forgetting a sentence also removes the notes of the conversations it was in.
+Your conversations go to that model and nowhere else.
+
+## Standing instructions
+
+Things you tell the assistant to always or never do ("never add comments to
+my code", "always run the tests before you suggest a commit", "from now on,
+write commit messages in the imperative") are kept as instructions. They
+lead the summary at the start of every session, in every project, and
+`MEMORY.md` lists them first so they are easy to check and to remove. A
+one-off request ("fix the failing test") is not kept.
+
+## Automatic capture in Claude Code
+
+Two hooks store each session when it ends and load the summary when the next
+one starts. Add to `~/.claude/settings.json` (or a project's
+`.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"matcher": "startup|resume|clear",
+      "hooks": [{"type": "command", "timeout": 30,
+        "command": "/absolute/path/to/rg/.venv/bin/sourcedrecall-hook session-start --owner 'Your Name'"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "timeout": 10,
+        "command": "/absolute/path/to/rg/.venv/bin/sourcedrecall-hook session-end --owner 'Your Name'"}]}]
+  }
+}
+```
+
+`session-end` reads the session transcript and stores what you typed and the
+assistant's replies (not tool calls, tool output or anything injected by the
+harness). It hands the work to a background process and returns at once; a
+log goes to `~/.sourcedrecall/hook.log`. Resuming a session and ending
+it again only adds the new turns. `session-start` adds nothing while the
+memory is empty.
+
+When a session starts you see a line listing what was saved since you last
+looked, in your own words, for example:
+
+    sourcedrecall saved 2 new things: "I moved to Brunswick last weekend."
+    (f3a1), "I'm allergic to penicillin." (f7c2). Ask Claude to forget any of
+    them by id, or see ~/.sourcedrecall/conversations/MEMORY.md.
+
+A new standing instruction for the assistant is always listed in full, since
+it is followed in every later session.
+
+Text you paste in for the assistant to work on (an email, a README, a page
+from the web) is stored with your message but not read as your own words, so
+a pasted "Never skip the checksum step" does not become an instruction.
+
+`SOURCEDRECALL_NOTICE=off` turns that line off. `SOURCEDRECALL_BRIEFING=off`
+stops the summary Claude gets at the start of a session; sessions are still
+stored and the tools still work.
+
+Coding sessions will add whatever you say about yourself in them, as well as
+some statements about the work. Use `memory_correct` to remove anything you
+don't want kept.
+
+## Automatic capture in Codex CLI, Gemini CLI and Cursor
+
+None of these has been tried with sourcedrecall yet. The hooks below follow
+each vendor's documentation and are covered by tests that feed them the
+documented input, but not by a real session.
+
+Codex CLI and Gemini CLI have the same session-start and session-end hooks as
+Claude Code, with the same fields on stdin, so the commands above work with
+`--agent codex` or `--agent gemini`. Cursor's hooks send different fields, so
+it has its own command, `sourcedrecall-hook cursor`.
+
+| agent | stored automatically | not covered |
+|---|---|---|
+| Codex CLI | what you typed and the assistant's replies, when the session ends; the summary at session start | sessions where the process is killed before it shuts down: import the rollout by hand |
+| Gemini CLI | the same, when you exit or run `/clear` | the same |
+| Cursor agent | each prompt and reply, stored when the agent finishes a turn and when the session ends; the summary at session start | text from before the hooks were installed; cloud agents; no "saved" line at session start |
+
+Codex, in `~/.codex/hooks.json` (or `[hooks]` in `~/.codex/config.toml`).
+Codex asks you to review new hooks once with `/hooks`, and gives `SessionEnd`
+at most 3 seconds, which is enough because the work runs in a background
+process:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"matcher": "startup|resume|clear",
+      "hooks": [{"type": "command", "timeout": 30,
+        "command": "/absolute/path/to/sourcedrecall-hook session-start --agent codex --owner 'Your Name'"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "timeout": 3,
+        "command": "/absolute/path/to/sourcedrecall-hook session-end --agent codex --owner 'Your Name'"}]}]
+  }
+}
+```
+
+Gemini CLI, in `~/.gemini/settings.json` (or `.gemini/settings.json` in a
+project). Timeouts there are in milliseconds, and Gemini does not wait for
+`SessionEnd`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"name": "sourcedrecall-start", "type": "command",
+        "timeout": 30000,
+        "command": "/absolute/path/to/sourcedrecall-hook session-start --agent gemini --owner 'Your Name'"}]}],
+    "SessionEnd": [{"hooks": [{"name": "sourcedrecall-end", "type": "command",
+        "timeout": 10000,
+        "command": "/absolute/path/to/sourcedrecall-hook session-end --agent gemini --owner 'Your Name'"}]}]
+  }
+}
+```
+
+Cursor, in `~/.cursor/hooks.json` (or `.cursor/hooks.json` in a project). Use
+the same command for each event; it reads the event name from the input:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart":       [{"command": "/absolute/path/to/sourcedrecall-hook cursor --owner 'Your Name'"}],
+    "beforeSubmitPrompt": [{"command": "/absolute/path/to/sourcedrecall-hook cursor --owner 'Your Name'"}],
+    "afterAgentResponse": [{"command": "/absolute/path/to/sourcedrecall-hook cursor --owner 'Your Name'"}],
+    "stop":               [{"command": "/absolute/path/to/sourcedrecall-hook cursor --owner 'Your Name'"}],
+    "sessionEnd":         [{"command": "/absolute/path/to/sourcedrecall-hook cursor --owner 'Your Name'"}]
+  }
+}
+```
+
+Cursor does not document its transcript file, so the Cursor hook never reads
+it. It writes each prompt and reply it is handed to
+`~/.sourcedrecall/cursor-spool/` (the same folder as your memory), stores
+them at each stop, and deletes that conversation's file at session end.
+
+Thoughts, tool calls, tool output and anything the tool injected itself
+(Codex's AGENTS.md and environment blocks, for example) are not stored. Each
+hook has been checked against the tool's documentation or source, in the
+way described in [docs/CLIENTS.md](../docs/CLIENTS.md), but they have not
+been run inside the live applications.
+
+To store a Codex or Gemini session by hand:
+
+```bash
+sourcedrecall-import codex  ~/.codex/sessions/2026/10/05/rollout-....jsonl
+sourcedrecall-import gemini ~/.gemini/tmp/<project hash>/chats/session-....jsonl
+```
+
+## Other agents and models
+
+Nothing in the memory calls a language model, and what it returns is plain
+text, so any model can use it.
+
+Any MCP client (Claude Desktop, Cursor, Windsurf, Cline, Continue, Zed,
+Goose, VS Code agent mode, Gemini CLI, Codex CLI) should run the same server,
+though none has been tried: point
+it at the `sourcedrecall` command with `SOURCEDRECALL_OWNER` set. The config
+for each, and the details of capture for Codex, Gemini and Cursor, are in
+[docs/CLIENTS.md](../docs/CLIENTS.md).
+
+Without MCP, use the command line from any script or harness:
+
+```bash
+# store a conversation: JSON Lines (or a JSON array) of {"role", "content"}
+cat chat.jsonl | sourcedrecall-memory ingest --id chat-42 --date 2026-03-02
+
+# what to put in any model's prompt, for one question or in general
+sourcedrecall-memory context "Where do I live?"
+sourcedrecall-memory context
+
+# what is stored about a question (--json for the full result)
+sourcedrecall-memory recall "Which university do I attend?"
+```
+
+Re-sending a conversation with the same `--id` adds only new messages.
+
+## Models
+
+There is no generative model in the server. Small models score text that
+is already stored. They run with ONNX Runtime from each model's official
+ONNX export, stored with half-precision weights and computed at full
+precision, so results are the same as the original PyTorch models at half
+the download. The English parser (Stanza's models) runs on ONNX Runtime
+too, through `stanza_ort`.
+
+| model | used by | what it does |
+|---|---|---|
+| `bge-small` + `ms-marco-MiniLM` cross-encoder | `memory_recall`, `memory_context` | ranks stored facts against a question |
+| `nli-deberta-v3-xsmall` | `memory_conflicts`, `memory_context` | decides whether two stored values contradict |
+
+`RG_PROFILE_V3=0` drops the retrieval pair (falls back to token overlap);
+`RG_NLI=0` drops the NLI model; `RG_PREWARM=0` stops the server loading them
+in the background at startup.
+
+It grew out of the Resonance Gate research project, a pre-registered study:
+[OSF 95e2q](https://osf.io/95e2q/).
+
+---
+
+## How `memory_store` reads a conversation
+
+`memory_store(turns, title=None, owner_name=None, date=None)` (each call is a new
+conversation; it is marked destructive, so a host that reads the hint asks you first)
+turns a conversation into facts. The extractor, rgx, is a set of grammar
+rules over a dependency parse.
+
+- A fact is only stored if it is stated in the turn's own words. Nothing is
+  sampled or paraphrased.
+- When the assistant reports something about the user ("I remember you
+  mentioning..."), it is kept separately under `hearsay` and never presented
+  as the user's own statement.
+- Each fact records its conversation, date and the sentence it came from.
+- A later move or new job marks the old address or employer as no longer
+  true. "I also joined..." is treated as a second job, not a change. Pass
+  `date` (ISO) when importing older conversations so they are ordered
+  correctly.
+- Ingesting the same conversation again only adds turns that are new.
+  `model_calls` in the response is always 0.
+
+## Persistence
+
+Conversation memory lives in `~/.sourcedrecall/conversations`
+(`conversations.json` plus an extraction cache; override with
+`RG_MEMORY_DIR`). A restart
+recovers it from disk.
+
+The server makes no network calls and needs no API keys. It sets
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so models are read from the
+local cache that `sourcedrecall-setup` filled.
+
+## Limitations
+
+- English only. A fragment with no subject is read as being about you only
+  when it opens your message and has a familiar shape ("Still nursing at St
+  Vincent's though", "Vegetarian now"); others, such as "Married, two kids",
+  are only partly read. After a question about someone else ("What does
+  your sister do?") a fragment is not stored.
+- Change tracking covers where you live, where you work, your job, diet,
+  relationship status, age, car and number of children. Other changes are
+  picked up only when you say something ended ("I quit", "I sold the car",
+  "no longer"). Two statements in the same conversation are not ordered
+  against each other.
+- Outside Claude Code, the agent has to call `memory_store` itself.
+- A pronoun is resolved only when one thing in the same message could be
+  meant. "I have a dog and a cat. It barks." stores nothing about barking.
+- A question asked in the first few seconds after the server starts can
+  take about 4 s while models load. After that, queries take tens of
+  milliseconds.
+
+## License
+
+Apache-2.0. See `LICENSE` and `NOTICE` in the repository root. If you use or
+adapt this work, please cite it (`CITATION.cff`).

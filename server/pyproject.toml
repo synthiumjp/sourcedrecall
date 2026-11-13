@@ -1,0 +1,62 @@
+[project]
+name = "sourcedrecall"
+version = "0.6.0"
+description = "Memory for AI agents that never calls a language model to store anything: your own dated messages, chosen and labelled by a grammar parser. MCP server and command line."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"   # 3.14 untested (review 4.5)
+license = "Apache-2.0"
+authors = [{ name = "Jon-Paul Cacioli" }]
+urls = { Homepage = "https://github.com/synthiumjp/sourcedrecall", Issues = "https://github.com/synthiumjp/sourcedrecall/issues" }
+# The memory code is loaded from the repo checkout (RG_ROOT) or carried in
+# the wheel (sourcedrecall/_core). There is NO generative model dependency:
+# the embedder, re-ranker and conflict checker are small ONNX models.
+# 2026-10-02 (new-user install test): stanza was missing -- profile_ingest
+# needs it for the deterministic parser -- and mcp was unpinned, so pip took
+# mcp 2.x, which no longer has mcp.server.fastmcp, and the server would not
+# start. Install CPU torch first (see README) or pip pulls ~4 GB of CUDA
+# wheels this server never uses.
+# 2026-10-21 (review): upper bounds at the next major version, so a release
+# on launch day cannot break every fresh install; tested with numpy 2.5,
+# onnxruntime 1.30-1.31, onnx 1.23, tokenizers 0.23, huggingface_hub 1.33 and
+# 2.2, nltk 3.10, mcp 1.30 (Python 3.12, macOS and Linux)
+dependencies = [
+    "mcp>=1.0,<2",
+    "numpy>=1.24,<3",
+    "onnxruntime>=1.17,<2",    # embedder, re-ranker, conflict checker
+    "onnx>=1.15,<2",
+    "tokenizers>=0.15,<1",
+    "huggingface_hub<3",
+    "nltk>=3.8,<4",
+]
+
+[project.optional-dependencies]
+# 2026-10-05: the parser runs on ONNX Runtime (stanza_ort) with models setup
+# downloads; Stanza with PyTorch is the fallback and the reference.
+stanza = [
+    "torch",
+    "stanza==1.14.0",       # pinned: the rgx rules are tuned and tested on this release; 1.15 parses "due to" and some fragments differently
+]
+
+# 2026-10-06: the optional in-process notes model (sourcedrecall-setup --notes)
+notes = [
+    "onnxruntime-genai>=0.17,<1",
+]
+
+[project.scripts]
+sourcedrecall = "sourcedrecall.mcp_server:main"
+sourcedrecall-setup = "sourcedrecall.setup_models:main"
+sourcedrecall-hook = "sourcedrecall.claude_hooks:main"
+sourcedrecall-memory = "sourcedrecall.memory_cli:main"
+sourcedrecall-import = "sourcedrecall.importers:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sourcedrecall"]
+# the memory code copied in by tools/build_wheel.py (git-ignored)
+artifacts = ["sourcedrecall/_core/**"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

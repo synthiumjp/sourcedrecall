@@ -1,0 +1,48 @@
+{
+  "name": "sourcedrecall",
+  "version": "0.6.0",
+  "description": "Local memory for Claude Code that keeps the record: what you said, in your own words with dates, and what each coding session did (commands, failures, fixes, decisions), searchable with /recall. Runs beside Claude Code's own memory. No language model writes the memory, and it stays on your machine.",
+  "author": {
+    "name": "Jon-Paul Cacioli"
+  },
+  "homepage": "https://github.com/synthiumjp/sourcedrecall",
+  "repository": "https://github.com/synthiumjp/sourcedrecall",
+  "keywords": [
+    "memory",
+    "mcp",
+    "local",
+    "privacy"
+  ],
+  "userConfig": {
+    "owner": {
+      "type": "string",
+      "title": "Your name",
+      "description": "The person this memory is about. Facts are written about this name.",
+      "required": true
+    },
+    "briefing": {
+      "type": "boolean",
+      "title": "Summary at session start",
+      "description": "Give Claude a short summary of what it knows about you at the start of each session. Turn off to use memory only when you or Claude ask for it.",
+      "default": true
+    },
+    "notes": {
+      "type": "string",
+      "title": "Notes (off, small or standard)",
+      "description": "Optional: a small model, run on your machine with no server, writes short notes of what you said once per session (small: 0.5 GB download; standard: 1.4 GB). Off by default: memory then uses no language model at all.",
+      "default": "off"
+    }
+  },
+  "mcpServers": {
+    "sourcedrecall": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/sourcedrecall-run",
+      "args": [
+        "mcp"
+      ],
+      "env": {
+        "SOURCEDRECALL_OWNER": "${user_config.owner}"
+      }
+    }
+  },
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,290 @@
+"""Does a stored fact ANSWER the question, or only share its topic?
+
+2026-10-02. "What is my partner's job?" retrieved "partner Sam works from
+home" and came back as an answer. Retrieval scores similarity, and a fact
+about the right entity is similar to any question about it, so similarity
+alone cannot tell "Sam's job" from "something about Sam". The same failure
+appears in JP's "Repetition Without Exclusivity" (child-scale LMs show
+repetition priming, never mutual exclusivity): without a mechanism in which
+candidate referents COMPETE, the familiar item wins. RINSE (arXiv
+2609.37469) names the missing signal for retrieval -- coverage of the
+question's components -- and "Two Axes of LLM Abstention" (arXiv 2607.08456)
+shows answerability needs its own decision, separate from relevance.
+
+This module is that decision, deterministic and cheap:
+  * read from the question WHAT is asked (an attribute: job, colour, name, a
+    number, a reason, a place) and ABOUT WHAT (my partner, my dog, Sam);
+  * a fact answers only if it mentions the entity AND supplies that kind of
+    answer.
+When the question has no recognisable asked attribute ("Do I own any
+pets?", "What do I eat?") nothing is decided here and retrieval stands.
+"""
+import re
+
+# --- what kind of answer an attribute needs ---------------------------------
+
+_COLOURS = set("""red orange yellow green blue purple violet pink brown black
+white grey gray silver gold beige navy teal maroon cream""".split())
+_NUMBER_WORDS = set("""zero one two three four five six seven eight nine ten
+eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen
+twenty thirty forty fifty sixty seventy eighty ninety hundred thousand million
+dozen half few several couple""".split())
+_LANGUAGES = set("""go rust python java javascript typescript ruby php kotlin
+swift scala haskell elixir erlang perl lua sql c c++ c# english german french
+spanish italian portuguese mandarin chinese japanese korean arabic hindi dutch
+greek russian""".split())
+_REASON = re.compile(r"\b(because|since|due to|so that|as it|as the|in order to"
+                     r"|thanks to|which is why)\b")
+_PREFERENCE = re.compile(r"\b(favou?rite|prefer\w*|love\w*|like\w*|enjoy\w*|"
+                         r"best)\b")
+_PLACE = re.compile(r"\b(in|at|from|near|based|located|lives?|moved|"
+                    r"headquartered)\b\s+[A-Z]|\b(live|lives|living|based|"
+                    r"located)\b")
+
+# attribute words -> answer kind
+_KIND = {}
+for k, words in {
+    "role": "job occupation profession role title work career position",
+    "employer": "employer company workplace firm",
+    "place": "address city town suburb country location home live based "
+             "located",
+    "colour": "colour color",
+    "name": "name called",
+    "number": "salary earn earns income cost price age old long often fast "
+              "tall big many much years year",
+    "time": "year when date birthday",
+    "reason": "why reason",
+    "language": "language languages",
+    "preference": "favourite favorite",
+    "kind": "breed kind type sort species variety make model brand",
+}.items():
+    for w in words.split():
+        _KIND.setdefault(w, k)
+
+_ROLE_WORDS = None
+
+
+def _roles():
+    global _ROLE_WORDS
+    if _ROLE_WORDS is None:
+        try:
+            from currency import _ROLES
+            _ROLE_WORDS = set(_ROLES)
+        except Exception:
+            _ROLE_WORDS = set()
+    return _ROLE_WORDS
+
+
+# --- reading the question ---------------------------------------------------
+
+_DET = r"(?:my|our|the|your|his|her|their)"
+_PATTERNS = [
+    # what is my partner's job / what's Sam's salary / what is Priya's last name
+    re.compile(rf"^(?:what|who)(?:'s| is| was| are)\s+(?:{_DET}\s+)?"
+               r"(?P<ent>[\w ]+?)'s\s+(?P<att>[\w ]+?)\??$"),
+    # how much does Sam earn / how old is my dog / how fast is my scooter
+    re.compile(rf"^how\s+(?P<att>\w+)\s+(?:is|are|was|does|do|did)\s+"
+               rf"(?:{_DET}\s+)?(?P<ent>[\w ]+?)(?:\s+\w+)?\??$"),
+    # what colour is my car / what breed is my dog / what year did I buy my car
+    re.compile(rf"^(?:what|which)\s+(?P<att>\w+)\s+(?:is|are|was|were)\s+"
+               rf"(?:{_DET}\s+)?(?P<ent>[\w ]+?)\??$"),
+    re.compile(rf"^(?:what|which)\s+(?P<att>year|colour|color|breed|brand|"
+               rf"model|size|name)\s+(?:did|do|does)\s+i\s+\w+\s+"
+               rf"(?:{_DET}\s+)?(?P<ent>[\w ]+?)\??$"),
+    # where is acme based / where does lee live
+    re.compile(r"^where\s+(?:is|are|does|do)\s+(?:my\s+|the\s+)?"
+               r"(?P<ent>(?!i\b)[\w ]+?)\s+(?P<att>based|located|live|work)\??$"),
+    # what is my job title / what is my favourite database / my salary
+    re.compile(r"^what(?:'s| is| was)\s+my\s+(?P<att>[\w ]+?)\??$"),
+]
+_TRIM = re.compile(r"\s+(?:at work|now|these days|currently|again|going to be|"
+                   r"going to|going|gonna be|gonna|turning|this year|next year)$")
+
+
+def read_question(q):
+    """-> (entity or None, attribute words) or None when nothing is asked
+    that this module can check. entity None means the owner."""
+    s = re.sub(r"\s+", " ", (q or "").strip().lower())
+    s = s.replace("’", "'")
+    for i, rx in enumerate(_PATTERNS):
+        m = rx.match(s)
+        if not m:
+            continue
+        att = _TRIM.sub("", m.group("att").strip())
+        ent = m.groupdict().get("ent")
+        if ent:
+            ent = ent.strip()
+            for _ in range(3):
+                ent = _TRIM.sub("", ent)
+        if ent:
+            # "the billing service in" -> "the billing service"
+            ent = re.sub(r"\s+(in|at|on|to|for|from|of|with|by)$", "", ent)
+            # "the atlas project written" -> "the atlas project"
+            ent = re.sub(r"\s+(written|made|built|based|located|run|hosted)$",
+                         "", ent)
+            # "i born in", "i buy" -> the owner
+            if re.match(r"^(i|me|myself)\b", ent):
+                ent = None
+        if ent in ("i", "me", "", "home", "my home", "my place", "my house",
+                   "my flat"):
+            ent = None           # "Which suburb is home?" is about the user
+        if i == 5:                       # "what is my X": X may be "favourite Y"
+            # "what is my daughter called" -> (daughter, name)
+            m = re.match(r"^(.+?)\s+(?:called|named)$", att)
+            if m:
+                return (m.group(1), "name")
+            words = att.split()
+            if words and words[0] in ("favourite", "favorite") and len(words) > 1:
+                return (" ".join(words[1:]), "favourite")
+            if not any(w in _KIND for w in words):
+                return None              # "what is my car like" etc.
+        return (ent, att)
+    return None
+
+
+def _kind(att):
+    words = att.split()
+    for w in reversed(words):            # "job title" -> role, "last name" -> name
+        if w in _KIND:
+            return _KIND[w]
+    return None
+
+
+_ENT_STOP = {"the", "and", "our", "your", "his", "her", "their", "its"}
+# generic heads: "the Atlas project" is mentioned by "Atlas is written in
+# Go"; "the billing service" still needs "billing" (review 2026-10-02)
+_GENERIC_HEADS = {"project", "service", "app", "application", "team",
+                  "company", "system", "tool", "product", "website", "site",
+                  "repo", "codebase", "platform", "thing"}
+
+
+# 2026-10-03 (dev paraphrase set): "my mother" is "Mum", "my sibling" is "my
+# brother Callum"
+_KIN = {"mother": "mum mom mam mummy mommy ma", "father": "dad daddy pa papa",
+        "grandmother": "nan nana gran granny grandma", "grandfather":
+        "grandpa granddad grandad pop", "partner": "husband wife boyfriend "
+        "girlfriend fiance fiancee spouse", "spouse": "husband wife",
+        "sibling": "brother sister", "child": "son daughter kid",
+        "children": "son daughter kids", "kid": "son daughter child"}
+
+
+def _mentions(text, ent):
+    """Every content word of the entity: "the billing service" is not
+    mentioned by "the pricing service" (tools/scale_test.py, 2026-10-02 --
+    any one word let filler about other services answer)."""
+    if not ent:
+        return True
+    words = [w for w in re.findall(r"[a-z]+", ent)
+             if len(w) > 2 and w not in _ENT_STOP]
+    specific = [w for w in words if w not in _GENERIC_HEADS]
+    words = specific or words
+    tl = text.lower()
+
+    def present(w):
+        if re.search(rf"\b{re.escape(w)}s?\b", tl):
+            return True
+        alts = _KIN.get(w) or _KIN.get(w.rstrip("s"))
+        if alts and any(re.search(rf"\b{a}s?\b", tl) for a in alts.split()):
+            return True
+        try:
+            import answer_type as _AT
+            return any(_AT.related(w, t) for t in re.findall(r"[a-z]+", tl)
+                       if len(t) > 2)
+        except Exception:
+            return False
+    return all(present(w) for w in words) if words else True
+
+
+def _names_a_kind(tl, ent):
+    ent_words = re.findall(r"[a-z]+", (ent or "").lower())
+    if not ent_words:
+        return False
+    import answer_type as _AT
+    head = _AT._singular(ent_words[-1])
+    closed = _AT._closed(head)
+    for w in set(re.findall(r"[a-z]+", tl)) - set(ent_words) - _AT._STOP:
+        if len(w) < 3 or _AT._singular(w) == head:
+            continue
+        if w in closed or _below(w, head, 2):
+            return True
+    return False
+
+
+def _below(word, head, depth):
+    """Is `word` at least `depth` hypernym steps under `head` in WordNet?
+    One step is a life stage or a plain sub-kind ("puppy", "sedan"), not
+    what "breed" or "make" asks for; breeds sit deeper ("beagle -> hound ->
+    hunting dog -> dog")."""
+    import answer_type as _AT
+    wn = _AT._wn()
+    if wn is None:
+        return False
+    tsyn = set(wn.synsets(head, pos=wn.NOUN))
+    for syn in wn.synsets(word, pos=wn.NOUN)[:8]:
+        for path in syn.hypernym_paths():
+            hit = [i for i, x in enumerate(path) if x in tsyn]
+            if hit and len(path) - 1 - hit[-1] >= depth:
+                return True
+    return False
+
+
+def answers(fact, q_read, owner=None):
+    """Does this fact (a recall dict with text/said/attribute/value) supply
+    what the question asks?"""
+    ent, att = q_read
+    text = " ".join(str(fact.get(k) or "") for k in ("text", "said"))
+    tl = text.lower()
+    if not _mentions(text, ent):
+        return False
+    kind = _kind(att)
+    toks = set(re.findall(r"[a-z+#]+", tl))
+    if kind == "role":
+        return bool(toks & _roles()) or "works as" in tl
+    if kind == "employer":
+        return bool(re.search(r"\b(works? (?:at|for)|joined|employ\w*|"
+                              r"job at)\b", tl))
+    if kind == "place":
+        return bool(_PLACE.search(text))
+    if kind == "colour":
+        return bool(toks & _COLOURS)
+    if kind == "name":
+        # 2026-10-02 (tools/scale_test.py): "any two capitalised words" let
+        # "What is Priya's last name?" be answered by "Alex Reyes's manager
+        # Priya suggested it" -- the capitals were the owner's own name. A
+        # name answers when it is introduced as one, or stands right after
+        # the entity ("Priya Sharma", "my cat Tom").
+        if re.search(r"\b(called|named|name is)\b", tl):
+            return True
+        # Review 2026-10-02: "My wife is Priya", "my dentist is Dr Lee" -- a
+        # copula and a title may stand between the entity and the name.
+        own = {w.lower() for w in re.findall(r"[A-Za-z]+", owner or "")}
+        for w in [w for w in re.findall(r"[a-z]+", ent or "") if len(w) > 2]:
+            for m in re.finditer(
+                    rf"\b{re.escape(w)}(?:'s|s)?\b(?:\s+(?:is|was|'s))?"
+                    rf"(?:\s+(?:Dr|Mr|Mrs|Ms|Miss|Prof)\.?)?\s+([A-Za-z]+)",
+                    text, re.I):
+                nm = m.group(1)
+                if nm[0].isupper() and nm.lower() not in own:
+                    return True
+        return False
+    if kind == "number":
+        return bool(re.search(r"\d", tl) or toks & _NUMBER_WORDS)
+    if kind == "time":
+        return bool(re.search(r"\b(19|20)\d\d\b|\b(january|february|march|april|"
+                              r"may|june|july|august|september|october|"
+                              r"november|december|last|ago|since)\b", tl))
+    if kind == "reason":
+        return bool(_REASON.search(tl))
+    if kind == "language":
+        return bool(toks & _LANGUAGES)
+    if kind == "preference":
+        return bool(_PREFERENCE.search(tl))
+    if kind == "kind" and _names_a_kind(tl, ent):
+        # 2026-10-03 (fresh install on the Mac): "What breed is my dog?" was
+        # refused against "My dog Biscuit is a beagle" -- "breed" is never
+        # said. A word naming a kind of the entity answers it (WordNet: a
+        # beagle is a dog; a closed list for car makes).
+        return True
+    # no known kind: the attribute word itself must appear
+    words = [w for w in re.findall(r"[a-z]+", att) if len(w) > 2]
+    return bool(words) and all(re.search(rf"\b{re.escape(w)}", tl) for w in words)

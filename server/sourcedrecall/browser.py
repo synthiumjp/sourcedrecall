@@ -1,0 +1,274 @@
+"""Read-only local memory browser, served on 127.0.0.1.
+
+  /          what the memory holds about you, grouped as in MEMORY.md, each
+             fact with your exact words, the date and its id; a search box
+             shows what recall returns for a question (2026-10-03)
+  /history   past coding sessions per project: what failed and what fixed
+             it, decisions, commits; a search box runs history_search
+             (2026-10-23)
+
+Read-only by design, so you can see exactly what the memory holds: forget a
+fact with `sourcedrecall-memory forget <id>` or by asking the assistant.
+
+No framework, no external assets, localhost bind only. Never a leak surface:
+it only renders records already stored via the audited tools.
+"""
+
+import html
+import http.server
+import threading
+
+MEM_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>sourcedrecall memory</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ :root{{--bg:#fff;--fg:#1d1f23;--mute:#6b7280;--line:#e5e7eb;--acc:#2f5fd0;--old:#9a6700}}
+ @media (prefers-color-scheme: dark){{:root{{--bg:#0f1115;--fg:#e6e6e6;--mute:#8b93a1;--line:#23272f;--acc:#9db4ff;--old:#e3b341}}}}
+ body{{font:15px/1.5 system-ui,sans-serif;margin:0;background:var(--bg);color:var(--fg)}}
+ header,main,footer{{max-width:880px;margin:0 auto;padding:16px}}
+ h1{{font-size:20px;margin:0}} h2{{font-size:15px;margin:28px 0 8px;color:var(--mute);font-weight:600}}
+ .sub,.meta,footer{{color:var(--mute);font-size:13px}}
+ form{{margin-top:12px;display:flex;gap:8px}} input{{flex:1;padding:8px 10px;font:inherit;
+  border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}}
+ button{{padding:8px 14px;font:inherit;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}}
+ ul{{list-style:none;padding:0;margin:0}} li{{padding:8px 0;border-bottom:1px solid var(--line)}}
+ .said{{color:var(--mute)}} .tag{{color:var(--old);font-size:13px}} code{{color:var(--mute);font-size:12px}}
+ .result{{border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin-top:12px}}
+ a{{color:var(--acc)}}
+</style></head><body>
+<header><h1>{title}</h1>
+<div class="sub">{n} facts · read-only · <a href="/">refresh</a> · <a href="/history">coding history</a></div>
+<form method="get" action="/"><input name="q" value="{q}" placeholder="Ask what it remembers, e.g. Where do I live?">
+<button>Recall</button></form>{result}</header>
+<main>{body}</main>
+<footer>Each line is a short summary, then your exact words and the date. To remove one:
+<code>{forget}</code>, or ask your assistant to forget it.</footer>
+</body></html>"""
+
+
+def _fact_li(f, tag=""):
+    e = html.escape
+    text = e(f.get("text") or f"{f.get('attribute')}: {f.get('value')}")
+    said = (f.get("said") or "").strip()
+    date = ((f.get("receipts") or [{}])[0].get("date") or "")
+    bits = []
+    if said:
+        bits.append(f'<span class="said">"{e(said[:240])}"</span>')
+    if date:
+        bits.append(e(str(date)[:10]))
+    if (f.get("mentions") or 0) > 1:
+        bits.append(f"said {f['mentions']}x")
+    labels = [t for t, on in (("no longer true", f.get("current") is False),
+                              ("said in passing", f.get("passing")),
+                              ("may have changed since", f.get("changed_later")),
+                              ("possibly related", f.get("related"))) if on]
+    lab = "".join(f'<span class="tag">({t})</span> ' for t in labels) or tag
+    return (f"<li>{lab}{text}<div class='meta'>{' · '.join(bits)} · "
+            f"<code>{e(str(f.get('id') or ''))}</code></div></li>")
+
+
+def _render_memory(owner, groups, q="", rec=None):
+    e = html.escape
+    n = sum(len(g) for _, g in groups)
+    body = "".join(f"<h2>{e(t)}</h2><ul>{''.join(_fact_li(f) for f in g)}</ul>"
+                   for t, g in groups)
+    # 2026-10-05: notes written by the user's own model (opt-in notes mode)
+    try:
+        from sourcedrecall import profile_memory as _pm
+        notes = sorted(_pm._load_notes(), key=lambda r: str(r.get("date") or ""),
+                       reverse=True)
+    except Exception:
+        notes = []
+    if notes:
+        items = "".join(
+            f"<li>{e(r['text'])} <span class='sub'>{e(str(r.get('date') or ''))}"
+            f" · id <code>{e(_pm._note_id(r))}</code></span></li>" for r in notes)
+        body += f"<h2>Notes written by your model</h2><ul>{items}</ul>"
+    body = body or "<p class='sub'>Nothing stored yet.</p>"
+    result = ""
+    if q:
+        if rec and rec.get("found"):
+            items = "".join(_fact_li(f) for f in rec.get("ranked") or [])
+            result = f"<div class='result'><ul>{items}</ul></div>"
+        elif rec and rec.get("related"):
+            items = "".join(_fact_li(f) for f in rec["related"])
+            result = ("<div class='result'><div class='sub'>Nothing stored is known "
+                      f"to answer this. Closest things said:</div><ul>{items}</ul></div>")
+        else:
+            result = "<div class='result sub'>Nothing stored about this.</div>"
+    title = f"Memory: {e(owner)}" if owner else "Memory"
+    from sourcedrecall.paths import command
+    return MEM_PAGE.format(title=title, n=n, q=e(q), result=result, body=body,
+                           forget=e(command("memory forget <id>")))
+
+
+HIST_PAGE = MEM_PAGE.replace('{n} facts · read-only · <a href="/">refresh</a>',
+                             '{n} coding sessions · read-only · <a href="/">memory</a>') \
+    .replace('action="/"', 'action="/history"') \
+    .replace("e.g. Where do I live?", "e.g. How did we fix the Docker build?") \
+    .replace(">Recall<", ">Search<") \
+    .replace("Each line is a short summary, then your exact words and the date.",
+             "Read from each session's tool calls and what was said, with no model call; "
+             "tool output is not kept beyond a failed command's error line.")
+
+_HIST_KINDS = (("unresolved", "still failing at the end"), ("fixed", "fixed"),
+               ("decision", "decided"), ("commit", "committed"))
+
+
+def _render_history(q="", per_project=20):
+    """2026-10-23 (docs/PLAN_GAPS G4): each project's past coding sessions,
+    newest first, with what failed and what fixed it, decisions and commits;
+    the search box shows what history_search returns."""
+    from sourcedrecall import profile_memory as pm
+    from sourcedrecall.paths import command
+    e = html.escape
+    keys = pm._forgotten_keys()
+    rows = [r for r in pm._load_episodes() if not pm._is_forgotten(r.get("text", ""), keys)]
+    by = {}
+    for r in rows:
+        by.setdefault(r.get("scope") or "(no project)", {}).setdefault(r["conv"], []).append(r)
+    body = ""
+    for scope in sorted(by, key=lambda s: max((r.get("date") or "") for c in by[s].values() for r in c),
+                        reverse=True):
+        convs = sorted(by[scope].values(), key=lambda c: max(r.get("date") or "" for r in c),
+                       reverse=True)
+        n_ex = sum(r["kind"] == "excerpt" for c in convs for r in c)
+        body += (f"<h2>{e(scope)}</h2><div class='sub'>{len(convs)} session(s), "
+                 f"{n_ex} searchable passage(s)</div><ul>")
+        for c in convs[:per_project]:
+            sess = next((r for r in c if r["kind"] == "session"), None)
+            head = sess["text"].removeprefix("session: ") if sess else c[0]["conv"]
+            items = "".join(
+                f"<div class='meta'><span class='tag'>{label}:</span> {e(r['text'])} "
+                f"<code>{e(pm._episode_id(r))}</code></div>"
+                for kind, label in _HIST_KINDS for r in c if r["kind"] == kind)
+            body += (f"<li>{e(head)}<div class='meta'>{e(str(c[0].get('date') or ''))}</div>"
+                     f"{items}</li>")
+        if len(convs) > per_project:
+            body += f"<li class='sub'>and {len(convs) - per_project} older session(s)</li>"
+        body += "</ul>"
+    body = body or (f"<p class='sub'>No coding sessions stored yet. "
+                    f"<code>{e(command('import claude-code'))}</code> stores past ones.</p>")
+    result = ""
+    if q:
+        hits = pm.profile_history(q, all_projects=True, records=5)["results"]
+        items = "".join(f"<li><span class='tag'>{e(h['kind'])}</span> "
+                        f"{'<br>'.join(e(x) for x in h['text'].splitlines())}"
+                        f"<div class='meta'>{e(str(h.get('date') or ''))} · {e(str(h.get('project') or ''))}"
+                        f" · <code>{e(h['id'])}</code></div></li>" for h in hits)
+        result = (f"<div class='result'><ul>{items}</ul></div>" if hits
+                  else "<div class='result sub'>Nothing found.</div>")
+    return HIST_PAGE.format(title="Coding history", n=sum(len(v) for v in by.values()),
+                            q=e(q), result=result, body=body,
+                            forget=e(command("memory forget <id>")))
+
+
+# 2026-10-09 (security review): the browser answered any Host header (a web
+# page could rebind its name to 127.0.0.1 and read the memory) and anyone on
+# the machine. Now: loopback Host names only, a random token per run (in the
+# printed address once, then a strict cookie), and headers that keep the
+# page from being framed, sniffed, cached or running scripts.
+_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                               "form-action 'self'; frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
+
+
+def new_token():
+    import secrets
+    return secrets.token_urlsafe(18)
+
+
+def make_handler(service, token=None):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, body, ctype="text/html; charset=utf-8", status=200, cookie=None):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in _HEADERS.items():
+                self.send_header(k, v)
+            if cookie:
+                self.send_header("Set-Cookie", f"sdr={cookie}; HttpOnly; SameSite=Strict; Path=/")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _allowed(self, query):
+            port = self.server.server_address[1]
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host not in {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}:
+                return False, None
+            if not token:
+                return True, None
+            import hmac
+            given = (query.get("t") or [""])[0]
+            if given and hmac.compare_digest(given, token):
+                return True, token                       # set the cookie
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "sdr" and hmac.compare_digest(v, token):
+                    return True, None
+            return False, None
+
+        def do_GET(self):
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(self.path)
+            ok, cookie = self._allowed(parse_qs(u.query))
+            if not ok:
+                from sourcedrecall.paths import command
+                self._send(f"Open the address printed by `{command('memory view')}` "
+                           "(it carries this run's key).", "text/plain; charset=utf-8", 403)
+                return
+            if cookie:
+                # drop the key from the address bar
+                self.send_response(303)
+                self.send_header("Location", u.path or "/")
+                for k, v in _HEADERS.items():
+                    self.send_header(k, v)
+                self.send_header("Set-Cookie", f"sdr={cookie}; HttpOnly; SameSite=Strict; Path=/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if u.path == "/history":
+                q = (parse_qs(u.query).get("q") or [""])[0].strip()[:300]
+                self._send(_render_history(q))
+            elif u.path == "/":
+                from sourcedrecall import profile_memory as pm
+                q = (parse_qs(u.query).get("q") or [""])[0].strip()[:300]
+                owner, groups = pm.memory_groups()
+                rec = pm.profile_recall(q) if q else None
+                self._send(_render_memory(owner, groups, q, rec))
+            else:
+                self.send_error(404)
+
+        def log_message(self, *a):
+            pass  # quiet
+    return Handler
+
+
+def url_file():
+    from sourcedrecall.paths import private_dir, state_dir
+    import os
+    return os.path.join(private_dir(state_dir()), "browser-url")
+
+
+def start_browser(service, port=7071, host="127.0.0.1"):
+    """Start the read-only browser on host:port in a daemon thread. host is
+    forced to loopback — the browser never binds a public interface. Its
+    address, with this run's key, is written to browser-url in the private
+    state dir (`sourcedrecall-memory view` prints it)."""
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("browser binds loopback only")
+    token = new_token()
+    httpd = http.server.HTTPServer((host, port), make_handler(service, token))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        with open(url_file(), "w") as f:
+            f.write(f"http://127.0.0.1:{port}/?t={token}\n")
+    except OSError:
+        pass
+    return httpd

@@ -1,0 +1,711 @@
+"""Supersession must resolve changing attributes without discarding knowledge."""
+import os
+
+import pytest
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import currency as C  # noqa: E402
+
+
+def _job(v, s):
+    return {"attr": "occupation", "value": v, "session": s}
+
+
+def test_latest_value_wins_for_single_valued_attributes():
+    facts = [_job("senior data scientist", 1), _job("lead data analyst", 3),
+             _job("chief visionary officer", 56)]
+    cur = C.current(facts)
+    assert [f["value"] for f in cur] == ["chief visionary officer"]
+
+
+def test_history_is_kept_not_deleted():
+    """"Where did I work before?" is the same data read the other way. A
+    memory that drops superseded values cannot answer it."""
+    facts = [_job("senior data scientist", 1), _job("lead data analyst", 3),
+             _job("chief visionary officer", 56)]
+    hist = C.history(facts, "occupation")
+    assert [v for v, _, _ in hist] == ["senior data scientist",
+                                       "lead data analyst",
+                                       "chief visionary officer"]
+    assert [c for _, _, c in hist] == [False, False, True]
+    assert all(f.get("superseded_by") is not None
+               for f in C.resolve(facts) if not f["current"])
+
+
+def test_restating_is_distinguished_from_superseding():
+    """They mean opposite things about confidence: a repeat is corroboration,
+    a change is revision. Collapsing them would make a fact look revised every
+    time the user mentioned it again."""
+    facts = [_job("freelancer", 29), _job("freelancer", 31), _job("founder", 39)]
+    r = C.resolve(facts)
+    assert r[0]["restated_by"] == 1 and r[0]["superseded_by"] is None
+    assert r[1]["superseded_by"] == 2 and r[1]["restated_by"] is None
+
+
+def test_multi_valued_attributes_all_survive():
+    """The dangerous failure: applying 'latest wins' to hobbies would leave a
+    person with exactly one hobby. Over-eager supersession loses data; a
+    missed one only leaves clutter, so the default must be to accumulate."""
+    facts = [{"attr": "hobby", "value": "puzzle games"},
+             {"attr": "hobby", "value": "strategy games"},
+             {"attr": "belief", "value": "data predicts behaviour"},
+             {"attr": "belief", "value": "collaboration matters"}]
+    assert len(C.current(facts)) == 4
+
+
+def test_repeating_the_same_value_is_not_a_change():
+    facts = [_job("freelancer", 29), _job("Freelancer", 31), _job("freelancer", 33)]
+    cur = C.current(facts)
+    assert len(cur) == 1 and cur[0]["session"] == 33
+
+
+def test_subjects_are_scoped_independently():
+    """Michelle changing jobs must not supersede her mentor's job."""
+    facts = [{"attr": "occupation", "value": "data scientist"},
+             {"attr": "sophia:occupation", "value": "mentor"},
+             {"attr": "occupation", "value": "founder"}]
+    cur = C.current(facts)
+    vals = sorted(f["value"] for f in cur)
+    assert vals == ["founder", "mentor"]
+
+
+def test_history_is_scoped_to_one_subject():
+    """Without scoping, a mentor's job lands in the owner's career timeline --
+    which is exactly how the first version read."""
+    facts = [{"attr": "occupation", "value": "data scientist", "session": 1},
+             {"attr": "sophia:occupation", "value": "mentor", "session": 5},
+             {"attr": "occupation", "value": "founder", "session": 39}]
+    owner = C.history(facts, "occupation")
+    assert [v for v, _, _ in owner] == ["data scientist", "founder"]
+    assert C.history(facts, "occupation", subject="sophia") == [
+        ("mentor", 5, True)]
+
+
+def test_non_person_subjects_are_identifiable():
+    for bad in ("Ai", "Team", "friends", "Colleagues"):
+        assert C.is_non_person_subject(bad), bad
+    for ok in ("Michelle Hernandez", "Sophia", "Alex Johnson"):
+        assert not C.is_non_person_subject(ok), ok
+
+
+def test_empty_and_single_inputs():
+    assert C.current([]) == []
+    one = C.current([_job("analyst", 1)])
+    assert len(one) == 1 and one[0]["current"]
+
+
+# --- write-time supersession (W1) -----------------------------------------
+
+def _node(attr, value, sessions):
+    return {"id": f"{attr}={value}", "attr": attr, "value": value,
+            "convs": {f"s{i}": f"2025-01-{i+1:02d}" for i in sessions}}
+
+
+def test_mark_current_supersedes_by_latest_session():
+    nodes = [_node("occupation", "senior data scientist", [1]),
+             _node("occupation", "lead data analyst", [3]),
+             _node("occupation", "chief visionary officer", [56])]
+    n = C.mark_current(nodes)
+    assert n == 2
+    cur = [x for x in nodes if x["current"]]
+    assert [x["value"] for x in cur] == ["chief visionary officer"]
+    assert all(x["superseded_by"] == "occupation=chief visionary officer"
+               for x in nodes if not x["current"])
+
+
+def test_mark_current_is_subject_scoped():
+    """The mentor changing jobs must not supersede the owner's job."""
+    nodes = [_node("occupation", "founder", [39]),
+             _node("sophia:occupation", "mentor", [50])]
+    C.mark_current(nodes)
+    assert all(x["current"] for x in nodes)
+
+
+def test_mark_current_leaves_multi_valued_attributes_alone():
+    nodes = [_node("hobby", "puzzle games", [2]),
+             _node("hobby", "strategy games", [40]),
+             _node("belief", "data predicts behaviour", [1]),
+             _node("belief", "collaboration matters", [30])]
+    assert C.mark_current(nodes) == 0
+    assert all(x["current"] for x in nodes)
+
+
+def test_mark_current_handles_non_ordinal_conversation_ids():
+    """run_wire/memops paths use real uuids, which carry no session order --
+    the date must carry it instead of everything collapsing to one bucket."""
+    a = {"id": "city=hobart", "attr": "city", "value": "hobart",
+         "convs": {"abc-123": "2024-01-01"}}
+    b = {"id": "city=sydney", "attr": "city", "value": "sydney",
+         "convs": {"def-456": "2025-06-01"}}
+    C.mark_current([a, b])
+    assert b["current"] and not a["current"]
+
+
+def test_mark_current_is_idempotent():
+    nodes = [_node("city", "hobart", [1]), _node("city", "sydney", [9])]
+    first = C.mark_current(nodes)
+    second = C.mark_current(nodes)
+    assert first == 1 and second == 1
+    assert sum(1 for x in nodes if x["current"]) == 1
+
+
+def test_mark_current_on_a_single_node_changes_nothing():
+    nodes = [_node("occupation", "analyst", [4])]
+    assert C.mark_current(nodes) == 0
+    assert nodes[0]["current"] and nodes[0]["superseded_by"] is None
+
+
+# --- state-slot aliasing (W2a) --------------------------------------------
+
+def test_aliases_group_one_concept_spelled_many_ways():
+    """Six slot names for physical health, all current and contradictory, was
+    the real reason W1 fired on 22 of 1270 nodes (e214)."""
+    nodes = [_node("physical_condition", "normal, no chronic diseases", [1]),
+             _node("health_status", "hypertension managed", [30]),
+             _node("health_condition", "chronic disease", [55])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]]
+    assert len(cur) == 1 and cur[0]["value"] == "chronic disease"
+
+
+def test_a_slot_naming_itself_past_can_never_win():
+    """"I used to work at Google", said late, must not become the current
+    employer. The extractor already told us it is old -- in the slot name."""
+    nodes = [_node("employer", "innovative ai corp", [10]),
+             _node("former_employer", "google", [56])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]]
+    assert len(cur) == 1 and cur[0]["value"] == "innovative ai corp"
+
+
+def test_past_only_group_still_yields_something():
+    """If every value is past-marked we must not return an empty answer."""
+    nodes = [_node("former_employer", "apple", [1]),
+             _node("previous_employer", "google", [9])]
+    C.mark_current(nodes)
+    assert sum(1 for x in nodes if x["current"]) == 1
+
+
+def test_narrative_slots_are_NOT_aliased():
+    """motivation holds 233 values for one user; merging narrative slots would
+    make supersession actively wrong."""
+    for a in ("motivation", "value", "belief", "plan", "goal",
+              "motivation_strategy", "routine", "habit", "health_habit",
+              "health_concern", "health_choice"):
+        canon, _ = C.canon_state_attr(a)
+        assert canon not in C.SINGLE_VALUED, f"{a} -> {canon} must stay multi-valued"
+    nodes = [_node("motivation", "curiosity", [1]),
+             _node("motivation_strategy", "growth", [40])]
+    C.mark_current(nodes)
+    assert all(x["current"] for x in nodes)
+
+
+def test_mental_and_physical_health_do_not_merge():
+    nodes = [_node("physical_health", "stable", [1]),
+             _node("mental_health", "positive", [2])]
+    C.mark_current(nodes)
+    assert all(x["current"] for x in nodes)
+
+
+def test_canon_state_attr_reports_past_without_renaming_the_store():
+    assert C.canon_state_attr("former_employer") == ("employer", True)
+    assert C.canon_state_attr("employer") == ("employer", False)
+    assert C.canon_state_attr("health_status") == ("health_condition", False)
+    assert C.canon_state_attr("wholly_unknown_slot") == ("wholly_unknown_slot", False)
+
+
+def test_a_genuine_tie_leaves_both_current():
+    """Two values in the SAME session with the same evidence: we do not know
+    which is current. Picking by list order chose a job duty over "chief
+    visionary officer" on the real store."""
+    a = _node("occupation", "chief visionary officer", [56])
+    b = _node("occupation", "enhancing decision-making", [56])
+    C.mark_current([a, b])
+    assert a["current"] and b["current"]
+
+
+def test_corroboration_breaks_a_same_session_tie():
+    a = dict(_node("occupation", "chief visionary officer", [56]), n_mentions=3)
+    b = dict(_node("occupation", "enhancing decision-making", [56]), n_mentions=1)
+    C.mark_current([a, b])
+    assert a["current"] and not b["current"]
+
+
+def test_recency_still_beats_corroboration_across_sessions():
+    """A well-corroborated OLD value must not outrank a newer one -- that is
+    the whole point of supersession."""
+    a = dict(_node("occupation", "data scientist", [1]), n_mentions=9)
+    b = dict(_node("occupation", "founder", [40]), n_mentions=1)
+    C.mark_current([a, b])
+    assert b["current"] and not a["current"]
+
+
+def test_the_current_node_records_what_it_replaced():
+    """Retrieval returns the CURRENT node and ranks the old value far lower,
+    so old->new alone hides the pair from every reader. "updated X from A to
+    B" needs A on the node that actually surfaces."""
+    nodes = [_node("monthly_income", "8210 usd", [1]),
+             _node("monthly_income", "8700 usd", [40])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]][0]
+    assert cur["value"] == "8700 usd"
+    assert cur["supersedes"] == ["8210 usd"]
+
+
+def test_supersedes_accumulates_in_order_across_a_chain():
+    nodes = [_node("occupation", "analyst", [1]),
+             _node("occupation", "lead", [10]),
+             _node("occupation", "founder", [40])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]][0]
+    assert cur["value"] == "founder"
+    assert cur["supersedes"] == ["analyst", "lead"]
+
+
+def test_supersedes_prefers_the_retired_node_s_proposition_text():
+    """entry 244 follow-up: rgx facts carry a full proposition in "text";
+    "supersedes" is read verbatim by callers (eval_rgp2.py's "updated
+    from:" annotation), so a bare value like "since becoming the senior
+    director" (an ungrammatical fragment out of context) must not leak --
+    the retired node's own text should be used when present."""
+    old = _node("occupation", "since becoming the senior director", [1])
+    old["text"] = "Martin Mark has worked previously with Acme"
+    new = _node("occupation", "director of engineering", [40])
+    C.mark_current([old, new])
+    assert new["current"] and not old["current"]
+    assert new["supersedes"] == ["Martin Mark has worked previously with Acme"]
+
+
+def test_supersedes_falls_back_to_value_when_no_text():
+    """LLM-cache facts have no "text" -- unchanged from before."""
+    old = _node("occupation", "analyst", [1])
+    new = _node("occupation", "founder", [40])
+    C.mark_current([old, new])
+    cur = [x for x in (old, new) if x["current"]][0]
+    assert cur["supersedes"] == ["analyst"]
+
+
+def test_restatements_do_not_pollute_supersedes():
+    nodes = [_node("city", "hobart", [1]), _node("city", "hobart", [5]),
+             _node("city", "sydney", [9])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]][0]
+    assert cur["supersedes"] == ["hobart", "hobart"] or cur["supersedes"] == ["hobart"]
+    assert "sydney" not in cur["supersedes"]
+
+
+def test_a_more_detailed_phrasing_is_the_same_fact_not_a_revision():
+    """"8700 usd" and "8700 usd monthly" are one fact. Calling it a revision
+    made the store report a change that never happened -- on an update metric
+    a fabricated update is worse than none."""
+    nodes = [_node("income", "8700 usd monthly", [3]),
+             _node("monthly_income", "8700 usd", [40])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]][0]
+    assert cur["supersedes"] == [], cur["supersedes"]
+
+
+def test_overlapping_but_different_values_are_still_a_revision():
+    nodes = [_node("monthly_income", "8210 usd", [1]),
+             _node("monthly_income", "8700 usd", [40])]
+    C.mark_current(nodes)
+    cur = [x for x in nodes if x["current"]][0]
+    assert cur["supersedes"] == ["8210 usd"]
+
+
+# ---- 2026-10-02: STATE CHANGES on the parser's own predicate keys ---------
+
+class _G:
+    def __init__(self, nodes):
+        self.nodes, self.provisional = nodes, {}
+
+
+def _n(nid, attr, value, conv, text=None, source=None):
+    return {"id": nid, "attr": attr, "value": value, "convs": {conv: "2026-10-02"},
+            "text": text or value, "source": source or text or value}
+
+
+ORDER = {"c1": 0, "c2": 1}
+
+
+def test_a_later_move_replaces_where_you_live():
+    """The stranger's test: 'I moved to Brunswick' left 'lives in Fitzroy'
+    current, and 'Where do I live?' answered Fitzroy."""
+    g = _G({"a": _n("a", "live_in", "in Fitzroy", "c1"),
+            "b": _n("b", "move_to", "to Brunswick", "c2")})
+    out = C.mark_state_changes(g, order=ORDER)
+    assert out == [("a", "b")]
+    assert g.nodes["a"]["current"] is False and g.nodes["a"]["ceased"] is True
+    assert g.nodes["b"].get("current", True) is True
+
+
+def test_a_restatement_is_not_a_change():
+    g = _G({"a": _n("a", "move_to", "to Brunswick", "c1"),
+            "b": _n("b", "live_in", "in Brunswick now", "c2")})
+    assert C.mark_state_changes(g, order=ORDER) == []
+
+
+def test_two_statements_in_one_conversation_are_not_ordered():
+    g = _G({"a": _n("a", "live_in", "in Fitzroy", "c1"),
+            "b": _n("b", "move_to", "to Brunswick", "c1")})
+    assert C.mark_state_changes(g, order=ORDER) == []
+
+
+def test_also_means_a_second_job_not_a_new_one():
+    """Found by the first run of this pass: 'I also joined the Alfred'
+    marked St Vincent's 'no longer true'."""
+    g = _G({"a": _n("a", "work_as", "as a nurse at St Vincent's", "c1"),
+            "b": _n("b", "join", "the Alfred as a ward manager", "c2",
+                    source="I also joined the Alfred as a ward manager.")})
+    assert C.mark_state_changes(g, order=ORDER) == []
+
+
+def test_a_new_job_replaces_the_old_employer():
+    g = _G({"a": _n("a", "work_at", "at Acme", "c1"),
+            "b": _n("b", "get", "a job at Canva", "c2")})
+    assert C.mark_state_changes(g, order=ORDER) == [("a", "b")]
+
+
+def test_a_plan_never_enters_a_family():
+    """'thinking about moving to X' is filed under think, not move_to."""
+    g = _G({"a": _n("a", "live_in", "in Fitzroy", "c1"),
+            "b": _n("b", "think", "about moving to Brunswick", "c2")})
+    assert C.mark_state_changes(g, order=ORDER) == []
+
+
+def test_hobbies_never_participate():
+    g = _G({"a": _n("a", "like", "jazz", "c1"),
+            "b": _n("b", "like", "techno", "c2")})
+    assert C.mark_state_changes(g, order=ORDER) == []
+
+
+# ---- 2026-10-02: the general inventory -- role, diet, status, age, car, kids
+
+def _pair(a1, v1, a2, v2):
+    return _G({"a": _n("a", a1, v1, "c1"), "b": _n("b", a2, v2, "c2")})
+
+
+@pytest.mark.parametrize("old,new", [
+    (("is", "a nurse"), ("is", "a ward manager now")),
+    (("work_as", "as a software engineer"), ("become", "a team lead")),
+    (("is", "vegetarian"), ("go", "vegan")),
+    (("is", "vegetarian"), ("eat", "meat again")),
+    (("is", "single"), ("marry_in", "in June")),
+    (("is", "34 years old"), ("turn", "35")),
+    (("drive", "a Volvo"), ("drive", "a Skoda now")),
+    (("drive", "a Volvo"), ("buy", "a Tesla")),
+    (("have", "two kids"), ("have", "three kids now")),
+    (("is", "married"), ("divorce", "last year")),
+    (("is", "single"), ("engage", "")),
+    (("is", "married"), ("separate", "")),
+    (("is", "a nurse"), ("retire", "last year")),
+    (("is", "33"), ("is", "34")),
+])
+def test_a_later_value_replaces_a_single_valued_state(old, new):
+    g = _pair(*old, *new)
+    assert C.mark_state_changes(g, order=ORDER) == [("a", "b")]
+
+
+@pytest.mark.parametrize("old,new", [
+    (("is", "a nurse"), ("is", "now a senior nurse at the Alfred")),  # restated
+    (("is", "a nurse"), ("is", "a huge fan of jazz")),                 # not a role
+    (("is", "a teacher"), ("is", "a runner")),                         # hobby
+    (("is", "vegetarian"), ("is", "a morning person")),
+    (("drive", "a Volvo"), ("buy", "a new kettle")),
+    (("like", "jazz"), ("like", "techno")),                            # multi-valued
+    (("is", "a nurse"), ("dad_retire", "")),                           # someone else
+    (("is", "divorced"), ("divorce", "")),                             # same value
+])
+def test_things_that_are_not_a_change_of_the_same_state(old, new):
+    assert C.mark_state_changes(_pair(*old, *new), order=ORDER) == []
+
+
+def test_a_role_and_an_employer_from_one_sentence_change_independently():
+    """'I work as a nurse at St Vincent's' states both; a later new role at
+    the same place replaces the role and leaves the employer current."""
+    g = _G({"a": _n("a", "work_as", "as a nurse at St Vincent's", "c1"),
+            "b": _n("b", "is", "a ward manager at St Vincent's now", "c2")})
+    assert C.mark_state_changes(g, order=ORDER) == [("a", "b")]
+
+
+@pytest.mark.parametrize("text,said,attr,value,want", [
+    ("Dana Cole is eating keto today", "I'm eating keto today.", "eat", "keto today", True),
+    ("Dana Cole is so tired", "I'm so tired.", "is", "so tired", True),
+    ("Dana Cole is in Sydney this week", "I'm in Sydney this week.", "is", "in sydney this week", True),
+    ("Dana Cole is vegetarian", "I'm vegetarian.", "is", "vegetarian", False),
+    ("Dana Cole is busy with the billing service migration", "I'm busy with the billing service migration.", "is", "busy with the billing service migration", False),
+    ("Dana Cole works at Acme", "I currently work at Acme.", "work_at", "at acme", False),
+])
+def test_a_remark_tied_to_its_moment(text, said, attr, value, want):
+    assert C.passing(text, said, attr, value) is want
+
+
+def test_a_passing_remark_never_replaces_a_lasting_state():
+    g = _G({"a": _n("a", "live_in", "in fitzroy", "c1"),
+            "b": _n("b", "live_in", "in sydney this week", "c2",
+                    source="I live in Sydney this week.")})
+    assert C.mark_state_changes(g, order=ORDER) == []
+
+
+@pytest.mark.parametrize("old,new", [
+    (("place", "in northcote"), ("relocate_to", "to coburg last week")),
+    (("eat", "completely vegan"), ("start", "eating fish again")),
+    (("is", "a barista at seven seeds"), ("start_as", "as a paralegal at a law firm")),
+    (("is", "a junior analyst at the bank"), ("promote_to", "to senior analyst on friday")),
+])
+def test_bench_dev_changes_of_state(old, new):
+    assert C.mark_state_changes(_pair(*old, *new), order=ORDER) == [("a", "b")]
+
+
+@pytest.mark.parametrize("old_text,cess_attr,cess_value,cess_text", [
+    ("Dana Cole drives a green Corolla", "sell", "the corolla on saturday",
+     "Dana Cole sold the Corolla on Saturday"),
+    ("Dana Cole's dog Biscuit needs a walk", "biscuit_die_on", "on tuesday",
+     "Biscuit died on Tuesday"),
+    ("Dana Cole's girlfriend Elise and Dana Cole are planning a trip",
+     "elise_split_over", "over the weekend",
+     "Elise and Dana Cole split up over the weekend"),
+    ("Dana Cole is taking evening classes in Italian", "drop",
+     "the italian class", "Dana Cole dropped the Italian class"),
+])
+def test_an_ending_names_what_it_ends(old_text, cess_attr, cess_value, cess_text):
+    g = _G({"a": _n("a", "x", "", "c1", text=old_text),
+            "b": _n("b", cess_attr, cess_value, "c2", text=cess_text)})
+    assert ("a", "b") in C.mark_ceased(g, order=ORDER)
+
+
+def test_a_job_described_by_what_you_do_for_an_organisation():
+    """Grounds a question about work, never replaces an employer: "I do the
+    garden for the council" is not a new job (review 2026-10-02)."""
+    fams = dict(C._families("do", "freight scheduling for a shipping firm",
+                            weak=True))
+    assert "employer" in fams
+    assert C._families("do", "freight scheduling for a shipping firm") == []
+    assert C._families("do", "the dishes for the family", weak=True) == []
+
+
+
+# ---- review 2026-10-02 (round 2): true facts wrongly ended ----------------
+
+@pytest.mark.parametrize("old,new", [
+    (("live_in", "in leeds"), ("flat", "in a terrible state")),
+    (("live_in", "in leeds"), ("house", "in need of a new roof")),
+    (("live_in", "in leeds"), ("house", "in good shape")),
+    (("is", "vegetarian"), ("start", "eating fish fingers for lunch")),
+    (("is", "vegetarian"), ("start", "eating meat-free burgers")),
+    (("is", "vegetarian"), ("eat", "fish and chips once a year on holiday")),
+    (("work_at", "at acme"), ("do", "freelance design for a charity")),
+    (("is", "a nurse"), ("start_as", "as an intern in a lab for a week")),
+    (("is", "a nurse"), ("hire_as", "as a tutor for my kid")),
+])
+def test_review2_not_a_change_of_state(old, new):
+    assert C.mark_state_changes(_pair(*old, *new), order=ORDER) == []
+
+
+@pytest.mark.parametrize("old_text,cess_text", [
+    ("Dana Cole lives in Leeds", "Dana Cole's friend died in Leeds last year"),
+    ("Dana Cole works at St Mary's", "Dana Cole's nan passed away at St Mary's"),
+    ("Dana Cole's dad has cancer", "Dana Cole's dog died of cancer"),
+    ("Dana Cole has a dog named Rex and a cat named Tom", "Tom died last year"),
+])
+def test_a_death_ends_only_what_names_who_died(old_text, cess_text):
+    g = _G({"a": _n("a", "x", "", "c1", text=old_text),
+            "b": _n("b", "die", "", "c2", text=cess_text)})
+    assert C.mark_ceased(g, order=ORDER) == []
+
+
+def test_a_place_in_the_old_fact_is_not_a_second_person():
+    """bench b05: "...a trip to Japan" made the guard think the fact named
+    someone besides Elise, so the breakup ended nothing."""
+    g = _G({"a": _n("a", "x", "", "c1",
+                    text="Jordan Pike's girlfriend Elise and Jordan Pike are planning a trip to Japan"),
+            "b": _n("b", "elise_split_over", "", "c2",
+                    text="Elise and Jordan Pike split up over the weekend")})
+    assert ("a", "b") in C.mark_ceased(g, order=ORDER)
+
+
+@pytest.mark.parametrize("text,said,want", [
+    # 2026-10-03 (answer view, dev set): the fact's own clause decides, and
+    # a life event is never a passing remark
+    ("Jordan Pike got married on Saturday",
+     "We got married on Saturday, and my husband Tomas burned the toast this morning.", False),
+    ("Jordan Pike's husband Tomas burned the toast this morning",
+     "We got married on Saturday, and my husband Tomas burned the toast this morning.", True),
+    ("Jordan Pike got engaged today", "Got engaged today!!", False),
+    ("Jordan Pike is in Sydney this week for work", "I'm in Sydney this week for work.", True),
+])
+def test_passing_is_judged_on_the_facts_own_clause(text, said, want):
+    assert C.passing(text, said) is want
+
+
+def test_the_users_own_ending_does_not_end_someone_elses_fact():
+    """2026-10-04 (wheel smoke test): "I left my home country" ended "my
+    grandma lives in my home country, Sweden"."""
+    g = _G({"a": _n("a", "grandma_live_in", "in sam reed's home country sweden", "c1",
+                    text="Sam Reed's grandma lives in Sam Reed's home country Sweden"),
+            "b": _n("b", "leave", "sam reed's home country", "c2",
+                    text="Sam Reed left Sam Reed's home country"),
+            "c": _n("c", "live_in", "in sam reed's home country", "c1",
+                    text="Sam Reed lives in Sam Reed's home country")})
+    out = C.mark_ceased(g, owner="Sam Reed", order=ORDER)
+    assert ("a", "b") not in out
+    assert ("c", "b") in out
+
+
+def _fn(nid, attr, value, conv, text):
+    return _n(nid, attr, value, conv, text=text)
+
+
+def test_a_later_fact_in_the_same_frame_may_have_changed_the_older():
+    g = _G({"a": _fn("a", "watsuki_be", "famous for Rurouni Kenshin", "c1",
+                     "Nobuhiro Watsuki is famous for Rurouni Kenshin"),
+            "b": _fn("b", "watsuki_be", "famous for The Fairly OddParents", "c2",
+                     "Nobuhiro Watsuki is famous for The Fairly OddParents")})
+    assert C.mark_frame_changes(g, order=ORDER) == [("a", "b")]
+    assert g.nodes["b"].get("maybe_changed_by") is None
+
+
+def test_frames_keep_the_whole_subject():
+    """The parser files both under 'thomas_bear_in'; they are two people."""
+    g = _G({"a": _fn("a", "thomas_bear_in", "in the city of London", "c1",
+                     "Thomas Kyd was born in the city of London"),
+            "b": _fn("b", "thomas_bear_in", "in the city of Bristol", "c2",
+                     "Thomas Arne was born in the city of Bristol")})
+    assert C.mark_frame_changes(g, order=ORDER) == []
+
+
+def test_a_slot_ends_at_the_first_name():
+    g = _G({"a": _fn("a", "henry_be", "a citizen of United States of America", "c1",
+                     "Henry Ford is a citizen of United States of America"),
+            "b": _fn("b", "henry_be", "a citizen of Canada", "c2",
+                     "Henry Ford is a citizen of Canada")})
+    assert C.mark_frame_changes(g, order=ORDER) == [("a", "b")]
+
+
+@pytest.mark.parametrize("old,new", [
+    (("sam_be", "tired", "Sam is tired"), ("sam_be", "happy", "Sam is happy")),
+    (("sam_visit", "Paris", "Sam visited Paris"), ("sam_visit", "Rome", "Sam visited Rome")),
+    (("sam_live_in", "in Paris", "Sam lives in Paris"),
+     ("sam_live_in", "in Rome", "Sam also lives in Rome")),
+])
+def test_not_a_frame_change(old, new):
+    g = _G({"a": _fn("a", *old[:2], "c1", old[2]), "b": _fn("b", *new[:2], "c2", new[2])})
+    assert C.mark_frame_changes(g, order=ORDER) == []
+
+
+@pytest.mark.parametrize("old,new", [
+    # 2026-10-28 (review H4): subjects that hold many values
+    (("nolan_direct", "Inception", "Christopher Nolan directed Inception"),
+     ("nolan_direct", "Oppenheimer", "Christopher Nolan directed Oppenheimer")),
+    (("sam_study_at", "at Oxford", "Sam Reed studied at Oxford"),
+     ("sam_study_at", "at Harvard", "Sam Reed studied at Harvard")),
+    (("sam_be", "allergic to peanuts", "Sam Reed is allergic to peanuts"),
+     ("sam_be", "allergic to dust", "Sam Reed is allergic to dust")),
+])
+def test_many_valued_frames_are_not_changes(old, new):
+    g = _G({"a": _fn("a", *old[:2], "c1", old[2]), "b": _fn("b", *new[:2], "c2", new[2])})
+    assert C.mark_frame_changes(g, order=ORDER) == []
+
+
+def test_a_passive_frame_of_a_many_valued_verb_holds_one_value():
+    g = _G({"a": _fn("a", "inception_direct_by", "by Christopher Nolan", "c1",
+                     "Inception was directed by Christopher Nolan"),
+            "b": _fn("b", "inception_direct_by", "by Denis Villeneuve", "c2",
+                     "Inception was directed by Denis Villeneuve")})
+    assert C.mark_frame_changes(g, order=ORDER) == [("a", "b")]
+
+
+def test_a_frame_filled_twice_at_once_holds_several_values():
+    g = _G({"a": _fn("a", "sam_be", "allergic to peanuts", "c1", "Sam is allergic to peanuts"),
+            "b": _fn("b", "sam_be", "allergic to shellfish", "c1", "Sam is allergic to shellfish"),
+            "c": _fn("c", "sam_be", "allergic to dust", "c2", "Sam is allergic to dust")})
+    assert C.mark_frame_changes(g, order=ORDER) == []
+
+
+def test_a_death_reads_the_facts_own_clause():
+    """2026-10-28 (review M2): the past tense of another clause does not
+    keep the fact current."""
+    g = _G({"a": _n("a", "watsuki_live_in", "in osaka", "c1",
+                    text="Nobuhiro Watsuki was born in Tokyo and lives in Osaka"),
+            "c": _n("c", "chanel_found_by", "by coco chanel", "c1",
+                    text="Chanel was founded by Coco Chanel"),
+            "b": _n("b", "watsuki_die", "", "c2", text="Nobuhiro Watsuki died")})
+    assert ("a", "b") in C.mark_ceased(g, owner="Dana Cole", order=ORDER)
+    g = _G({"c": _n("c", "chanel_found_by", "by coco chanel", "c1",
+                    text="Chanel was founded by Coco Chanel"),
+            "b": _n("b", "coco_die", "", "c2", text="Coco Chanel died")})
+    assert C.mark_ceased(g, owner="Dana Cole", order=ORDER) == []
+
+
+@pytest.mark.parametrize("cess_text", [
+    "Deborah's dad passed away two days ago",
+    "Deborah took him when Deborah's mother passed away",
+    "Deborah was heartbroken after her dog died",
+])
+def test_a_relatives_death_does_not_end_the_persons_own_facts(cess_text):
+    """2026-10-29 (LoCoMo conversation 7): these ended 140 of Deborah's
+    facts, read as her own death."""
+    g = _G({"a": _n("a", "deborah_teach", "yoga", "c1", text="Deborah teaches yoga"),
+            "b": _n("b", "die", "", "c2", text=cess_text)})
+    assert C.mark_ceased(g, owner="Jolene", order=ORDER) == []
+
+
+def test_a_death_named_after_the_relation_ends_that_persons_facts():
+    g = _G({"a": _n("a", "tom_live_in", "in leeds", "c1", text="Tom lives in Leeds"),
+            "d": _n("d", "sam_live_in", "in york", "c1", text="Sam lives in York"),
+            "b": _n("b", "die", "", "c2", text="Sam's friend Tom died last week")})
+    out = C.mark_ceased(g, owner="Jolene", order=ORDER)
+    assert ("a", "b") in out and ("d", "b") not in out
+
+
+def test_a_named_persons_death_still_ends_their_facts():
+    g = _G({"a": _n("a", "sam_live_in", "in york", "c1", text="Sam lives in York"),
+            "b": _n("b", "die", "", "c2", text="Sam died in the spring")})
+    assert ("a", "b") in C.mark_ceased(g, owner="Jolene", order=ORDER)
+
+
+# ---- 2026-10-29: LoCoMo's "no longer true" notes, read one by one --------
+
+@pytest.mark.parametrize("old,new", [
+    (("join", "a travel club"), ("join", "a group of globetrotters")),
+    (("join", "just yesterday a nearby church"), ("join", "a gym last week")),
+    (("join", "a new platform"), ("join", "an online gaming tournament yesterday")),
+    (("join", "forces to create a safe environment"), ("join", "a gym last week")),
+    (("start_at", "at least going for a run"), ("join", "a programming group online")),
+])
+def test_joining_a_club_is_not_a_new_job(old, new):
+    assert C.mark_state_changes(_pair(*old, *new), order=ORDER) == []
+
+
+def test_joining_a_company_still_replaces_the_old_one():
+    assert C.mark_state_changes(_pair("join", "Acme", "join", "Globex"), order=ORDER)
+
+
+def _dec(nid, value, conv):
+    return _n(nid, "decision", value, conv, text=f"Sam decided with the assistant: {value}")
+
+
+@pytest.mark.parametrize("old,new,changed", [
+    ("get planning for next month", "find something just as nice for our hike", False),
+    ("keep me posted and let me know if you need any suggestions or help",
+     "get planning for next month", False),
+    ("use postgres for the jobs table", "use sqlite instead", True),
+    ("switching the build to pnpm for the workspaces", "switch back to npm", True),
+])
+def test_a_decision_ends_another_only_on_the_same_topic(old, new, changed):
+    g = _G({"a": _dec("a", old, "c1"), "b": _dec("b", new, "c2")})
+    assert bool(C.mark_decision_changes(g, order=ORDER)) is changed
+
+
+@pytest.mark.parametrize("value,attr", [
+    ("hard", "work_on"), ("on supporting youth sports", "work_on"),
+    ("together", "work_on"), ("all about dedication", "work_on"),
+    ("a nurse", "occupation"), ("teaching", "occupation"),
+])
+def test_how_someone_works_is_not_their_occupation(value, attr):
+    import run_profile_full as PF
+    assert PF.how_one_works("occupation", value) == attr

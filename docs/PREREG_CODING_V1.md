@@ -1,0 +1,239 @@
+# Pre-registration: coding recall v1 (approved by JP 2026-10-22, frozen 2026-10-23)
+
+JP approved this design on 2026-10-22 evening, with the history at 40
+sessions. Frozen 2026-10-23 in the commit that adds this line, with the
+question writer prompt (bench/coding/make_questions.py), the Sonnet vet
+prompt (bench/coding/VET_SONNET.md), the extractor and retrieval as they
+are in that commit; no held-out session had been fetched. Nothing in "Held out" is
+read, tuned on or looked at before then. Plan: docs/PLAN_GAPS_2026-10-22.md, G1.
+
+Dev log:
+- 2026-10-22: first dev question set (107 questions) failed the 30-question
+  check, 8 of 30 by a blinded Sonnet reviewer (vague: "the test", "the
+  article"; generated file names; absolute paths). The writer prompt now
+  asks for the specific thing by name, one possible answer, repository
+  paths, no generated names, and "where" as where a change was made. The
+  question set is rewritten and the check repeated.
+- 2026-10-23: the rewritten set (111) failed again, 9 of 30 (trivial "which
+  file was modified" questions whose answer repeats the question; one copied
+  the prompt's example). A Qwen vetting pass agreed with the reviewer on 1 of
+  the 9. A Sonnet subagent then vetted all 111 with the question, gold and
+  evidence (never any system's output), on the reviewer's criteria: 53 kept
+  (fix 21, how 16, where 13, why 3). A fresh blinded Sonnet reviewer on 30 of
+  the 53: 5 fail, at the limit.
+
+- 2026-10-23, dev scores (Qwen reader, 111 questions / the 53 vetted):
+  records only: sourcedrecall 30 / 14, native-qwen 26 / 12, both 40 / 23,
+  rag 75 / 41. With session excerpts (61a1164): sourcedrecall 67 / 35
+  (2,493 context tokens), both 66 / 37, native-qwen 26 / 12 (7,545), rag
+  75 / 41 (2,581); ours vs rag 5 to 13, p=0.10; ours vs native 46 to 5.
+- 2026-10-23, dev variants of what sourcedrecall gives the reader (111 / 53):
+  10 passages, no records or messages 70 / 37 (vs rag 5 to 10, p=0.30);
+  8 passages, 4 records, 2 messages 68 / 36; passages with the first 300
+  characters of each command's output 67 / 34 (not kept: no gain, more
+  untrusted text). Of the 5 fix questions rag answered and passages-only
+  missed, 2 had the answer in a linter's error lines, which excerpts dropped;
+  a failed command now keeps up to three problem lines (4b9dfca).
+  With that: 10 passages 71 / 38, 8 passages and 3 records 65 / 33.
+  Frozen: 10 passages, no records, no messages; history_search returns
+  this by default.
+
+Held out, 2026-10-23: 485 questions written from 20 repositories, the
+Sonnet vet kept 268 (where 94, fix 89, how 78, why 7). JP read 30 random
+vetted ones (seed 20261023) before any answer was read and marked none bad
+("looks good ... concise without waffling"): the check passed.
+
+Held-out result, 2026-10-24 (Qwen reader and judge, 268 vetted questions,
+20 repositories; native memory written by Qwen, unfair to it):
+
+| | n | sourcedrecall | native-qwen | both | rag |
+|---|---|---|---|---|---|
+| fix | 89 | 54 | 19 | 56 | 58 |
+| how | 78 | 43 | 18 | 47 | 49 |
+| where | 94 | 79 | 23 | 81 | 78 |
+| why | 7 | 6 | 2 | 6 | 5 |
+| all | 268 | 182 (67.9%) | 62 (23.1%) | 190 (70.9%) | 190 (70.9%) |
+| context tokens | | 2,694 | 5,637 | 8,331 | 2,571 |
+
+- Main gate (both at least 10 points above native, p < 0.05): passed,
+  70.9% vs 23.1%, 133 to 5, p = 2e-33.
+- sourcedrecall at least matches native on fix: passed, 54 vs 19.
+- sourcedrecall at least matches plain retrieval overall: not met, 182 vs
+  190 (25 to 33, p = 0.36, not a significant difference).
+- The Qwen writer wiped one repository's native memory (forge, at session
+  25) and cut another's from 21 files to 8; without those two repositories
+  (241 questions): native 57, sourcedrecall 158, both 165, rag 170.
+- Blinded audit (2026-10-24): two Sonnet subagents re-judged 60 random
+  answers per system (240, shuffled, no system named) from question, gold,
+  evidence and answer. Agreement with the Qwen judge 218 of 240 (91%);
+  Sonnet / Qwen correct: sourcedrecall 41 / 39, native 15 / 12, both
+  48 / 45, rag 45 / 45. The Qwen judge is if anything stricter on the
+  memory systems; it does not favour sourcedrecall.
+- Second reader, Phi-4 (2026-10-24, same prompt, contexts and Qwen judge;
+  Phi-4's answers are long and some are cut at the 160-token limit, for
+  every system alike):
+
+  | | n | sourcedrecall | native-qwen | both | rag |
+  |---|---|---|---|---|---|
+  | fix | 89 | 49 | 11 | 43 | 51 |
+  | how | 78 | 46 | 17 | 41 | 45 |
+  | where | 94 | 74 | 21 | 79 | 74 |
+  | why | 7 | 6 | 2 | 4 | 5 |
+  | all | 268 | 175 (65.3%) | 51 (19.0%) | 167 (62.3%) | 175 (65.3%) |
+
+  both vs native 121 to 5 (p = 6e-30); sourcedrecall vs native 129 to 5
+  (p = 3e-32); sourcedrecall vs rag 30 to 30 (p = 1). With Phi-4, both is
+  below sourcedrecall alone: the longer context (8,331 tokens, native
+  first) costs this reader more than native adds.
+- Sonnet writer pilot (2026-10-24, not a result): Sonnet subagents in
+  Claude Code (no API credit) kept the native memory folder for one
+  repository picked by seed 20261024 (tpmjs/tpmjs, 27 sessions, 17
+  questions), same instructions and transcripts as the Qwen writer, a
+  fresh agent every 9 sessions; 429k tokens in all, 24 memories. Qwen
+  reader and judge: native-sonnet 6/17 (native-qwen 1/17), sourcedrecall
+  12/17, both-sonnet 14/17 (8 to 0 over native-sonnet), rag 13/17.
+  native-sonnet's context is 10,538 tokens (the whole folder; Claude Code
+  itself loads only MEMORY.md and opens files as needed).
+- Sonnet writer on 10 repositories (2026-10-25): the pilot's plus 9 more
+  drawn by the same seed (random.Random(20261024): the pilot's choice, then
+  sample(rest, 9)); 311 sessions, 136 vetted questions; about 4.5M Claude
+  Code tokens in all; every folder covers every session, 4 to 32 files.
+  The two largest folders (about 20k tokens) do not fit Qwen's 16k window,
+  so both Qwen servers were restarted at 32k for this run, same model and
+  settings. Qwen reader and judge:
+
+  | | n | sourcedrecall | native-qwen | both-qwen | rag | native-sonnet | both-sonnet |
+  |---|---|---|---|---|---|---|---|
+  | fix | 43 | 30 | 11 | 32 | 30 | 21 | 30 |
+  | how | 36 | 19 | 12 | 19 | 22 | 20 | 26 |
+  | where | 53 | 46 | 13 | 45 | 46 | 34 | 50 |
+  | why | 4 | 3 | 2 | 3 | 3 | 2 | 4 |
+  | all | 136 | 98 (72.1%) | 38 (27.9%) | 99 (72.8%) | 101 (74.3%) | 77 (56.6%) | 110 (80.9%) |
+  | context tokens | | 2,697 | 5,363 | 8,060 | 2,578 | 9,600 | 12,298 |
+
+  both-sonnet vs native-sonnet 40 to 7 (p = 1e-6), 24 points: the main
+  gate's margin holds against the Sonnet writer on these 10 repositories.
+  sourcedrecall vs native-sonnet 41 to 20 (p = 0.01); native-sonnet vs
+  native-qwen 45 to 6 (the Qwen writer was far below Claude's).
+  both-sonnet vs sourcedrecall 18 to 6 (p = 0.02); both-sonnet vs rag 18 to
+  9 (p = 0.12). native-sonnet reads the whole folder, which is generous to
+  it; Claude Code loads only MEMORY.md and opens files when it chooses.
+- Phi-4 as reader on the same 10 repositories (2026-10-25, Qwen judge;
+  Phi-4's window is 16k tokens: 50 native-sonnet or both-sonnet contexts
+  did not fit, so 34 questions, mostly from the three repositories with
+  the largest folders, are left out for every system; 102 questions):
+
+  | | n | sourcedrecall | native-qwen | both-qwen | rag | native-sonnet | both-sonnet |
+  |---|---|---|---|---|---|---|---|
+  | fix | 29 | 18 | 5 | 13 | 17 | 15 | 13 |
+  | how | 29 | 19 | 7 | 18 | 17 | 14 | 17 |
+  | where | 42 | 37 | 12 | 38 | 36 | 21 | 36 |
+  | why | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+  | all | 102 | 76 (74.5%) | 26 (25.5%) | 71 (69.6%) | 72 (70.6%) | 52 (51.0%) | 68 (66.7%) |
+  | context tokens | | 2,674 | 4,830 | 7,505 | 2,566 | 7,583 | 10,257 |
+
+  both-sonnet vs native-sonnet 27 to 11 (p = 0.014), 16 points;
+  sourcedrecall vs native-sonnet 33 to 9 (p = 0.0003). As in the Qwen-writer
+  run, with Phi-4 both is below sourcedrecall alone (9 to 17, p = 0.17).
+  The Qwen reader on the same 102: sourcedrecall 74, native-sonnet 59,
+  both-sonnet 83 (30 to 6 over native-sonnet), rag 77.
+- Still to do: the Sonnet writer on the other 10 held-out repositories
+  (about 6M Claude Code tokens); a Claude reader when API credit is back.
+
+Approved by JP 2026-10-23 for held out: the Sonnet vet as a step of the
+question protocol, after the automatic drops; 12 question sessions per
+repository instead of 6, since about half the questions survive the vet
+(about 200 held-out questions); the 30-question check by JP on the
+vetted held-out set, as a vet and a check by the same model family are not
+independent. Written into the sections below.
+
+## Question
+
+After a run of real coding sessions on one project, can the memory answer
+what a developer on that project asks later: what failed and what fixed it,
+how things are run, why something was decided, where a change was made?
+And does sourcedrecall add to native memory (Claude Code's own), or not?
+
+## Data
+
+SWE-chat v2 (SALT-NLP/SWE-chat, revision df393df, ODC-By; Baumann et al.,
+COLM 2026): real developer sessions from public repositories, with tool
+calls. Eligible: Claude Code sessions, not marked delta-only, at least 10
+tool calls; repositories with at least 20 such sessions, a permissive
+licence, not entireio/cli (28 users, 2,099 sessions). 89 repositories.
+Sorted by sha256("coding-v1:" + repo id): the first 10 are dev, the next 20
+held out (bench/coding/split_v1.json, sha256 65787c69...). Transcripts,
+questions and answers stay on the Mac and are not committed; results are
+counts.
+
+Second set (JP agreed 2026-10-22): JP's own Claude Code sessions, same
+protocol, on the Mac only, counts only, never committed or quoted.
+
+## History and questions
+
+Per repository, the history is its eligible sessions in time order, at most
+the first 40. Questions are asked as if at the start of the session after
+the history.
+
+Questions are written by Qwen3-14B from one history session at a time
+(12 sessions per repository, spread evenly over the history; 6 on dev), from a
+condensed transcript: what the user typed, the assistant's text, each tool
+call with its command or file and the first 300 characters of its result.
+Up to 3 per session, each of one type:
+
+- fix: what went wrong with something and what fixed it (or that it was
+  not fixed)
+- how: how something is run, built, tested or deployed in this project
+- why: why something was done or chosen, or what was ruled out
+- where: which file or component holds or changed something
+
+Each comes with a short gold answer and an evidence quote. Dropped
+automatically: evidence not found verbatim in the condensed transcript;
+questions Qwen3-14B answers correctly with no memory at all (general
+knowledge); near-duplicates; "where" answers that only repeat the question;
+questions a Qwen vetting pass drops. Then a Sonnet subagent vets every
+question from its question, gold answer and evidence, on the criteria in
+bench/coding/VET_SONNET.md, and only the kept ones are asked. The question
+writer and the vet never see any system's memory or answers. Before the
+held-out answers are read, JP reads 30 random vetted held-out questions;
+if more than 5 are not questions a developer would ask, the result is
+reported as failed on question quality, and the writer is fixed on dev.
+
+## Systems
+
+All get the same reader prompt and a context budget reported per question.
+
+1. sourcedrecall: what Claude would get for the question from
+   history_search with its defaults: the 10 best-matching passages of the
+   history's sessions (what the user and the assistant said, each tool call
+   by command or file, a failed command with up to three error lines; no
+   other tool output).
+2. native memory, simulated with Qwen3-14B as the writer
+   (bench/claude_memory.py's instructions, run after each session on the
+   condensed transcript). Labelled: Claude Code's memory is written by
+   Claude, so this is unfair to it. The Sonnet 5.5 writer is run as the
+   main comparison when API credit is back (about 3 weeks), unchanged.
+3. native memory and sourcedrecall together (both contexts, native first).
+4. plain retrieval: the top 10 chunks of the condensed transcripts (same
+   embedder), the baseline any memory must beat.
+
+## Reading and judging
+
+Reader Qwen3-14B (temperature 0), Phi-4 as second reader. Judge Qwen3-14B
+with the question, gold answer and evidence, strict prompt (the answer must
+state the gold's specific content; "I don't know" is wrong). A blinded
+audit of 60 judged answers per system on held out, as for the pasted-text
+sets.
+
+## Gates (decided now)
+
+- Main: native + sourcedrecall answers at least 10 points more than native
+  alone on held out, paired McNemar p < 0.05, with the Qwen reader.
+- sourcedrecall alone at least matches native alone on fix questions.
+- sourcedrecall alone at least matches plain retrieval overall (else the
+  records add nothing over searching the transcripts, and the README says
+  so).
+- Reported whatever the outcome, per type, both readers, with context size.
+
+If the main gate fails, launch stays held; the result is written up and
+the next step decided with JP.

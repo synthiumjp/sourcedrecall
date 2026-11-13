@@ -1,0 +1,187 @@
+"""Credentials never enter the memory (2026-10-02)."""
+import json
+import os
+
+import pytest
+
+from sourcedrecall.secrets import MARK, scrub
+
+
+@pytest.mark.parametrize("text", [
+    "My password for the staging server is hunter2.",
+    "Here's my API key: sk-proj-abc123def456ghi789jkl012mno345.",
+    "My PIN is 4821.",
+    "My card number is 4111 1111 1111 1111.",
+    "My SSN is 123-45-6789",
+    "token: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+])
+def test_a_credential_is_removed(text):
+    out = scrub(text)
+    assert MARK in out
+    for secret in ("hunter2", "sk-proj", "4821", "4111", "123-45", "ghp_"):
+        assert secret not in out
+
+
+@pytest.mark.parametrize("text", [
+    "Call me on 0412 345 678.", "I live in Fitzroy.",
+    "My password manager is 1Password.", "The order number is 4111 1111 1111 1112.",
+    "I knocked every pin down.",
+])
+def test_ordinary_text_is_left_alone(text):
+    assert scrub(text) == text
+
+
+def test_nothing_secret_is_stored(tmp_path, monkeypatch):
+    pytest.importorskip("stanza")
+    monkeypatch.setenv("RG_MEMORY_DIR", str(tmp_path))
+    monkeypatch.setenv("RG_NLI", "0")
+    import sourcedrecall.profile_memory as pm
+    pm._state.update({"mem": None, "audit_pass": None, "needs_reload": False,
+                      "uncached_turns": None, "transcripts": None})
+    pm._ingest_state.update({"extractor": None, "owner": None})
+    pm.profile_ingest([{"role": "user", "content":
+                        "My password for the staging server is hunter2."},
+                       {"role": "user", "content": "I live in Fitzroy."}],
+                      conversation_id="a", owner_name="Dana Cole",
+                      date="2026-03-02")
+    for f in os.listdir(tmp_path):
+        assert "hunter2" not in open(tmp_path / f, encoding="utf-8").read(), f
+    r = pm.profile_recall("What is my password?")
+    assert "hunter2" not in json.dumps(r)
+
+
+
+# review round 3: every one of these leaked through the first scrubber
+@pytest.mark.parametrize("text,secret", [
+    ("pw: hunter2", "hunter2"), ("My pw is hunter2", "hunter2"),
+    ("hunter2 is my password", "hunter2"), ("I use hunter2 as my password", "hunter2"),
+    ("My password, hunter2, is weak", "hunter2"), ("I set my password to hunter2", "hunter2"),
+    ("my password's hunter2", "hunter2"), ("The PIN is: 4821", "4821"),
+    ("the wifi password? it's tulip99", "tulip99"),
+    ("What is my password? It is hunter2", "hunter2"),
+    ("My password is the following. hunter2", "hunter2"),
+    ("my login is bob / hunter2", "hunter2"), ("user: bob, pass: hunter2", "hunter2"),
+    ("mongodb://bob:hunter2@host", "hunter2"),
+    ('My password is "correct horse battery staple"', "battery"),
+    ("account number is 1234 5678 9012", "5678"), ("my SSN is 123 45 6789", "6789"),
+    ("my door code is 4821", "4821"), ("the code to the safe is 4821", "4821"),
+    ("My bank account is 12345678", "12345678"), ("my wifi key is hunter2", "hunter2"),
+    ("The key is hunter2", "hunter2"),
+    ("Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456", "abcdefghij"),
+])
+def test_review3_leaks_are_closed(text, secret):
+    assert secret not in scrub(text)
+
+
+@pytest.mark.parametrize("text", [
+    "the secret is that I hate my job", "I forgot my password again.",
+    "The key is to stay calm.", "my secret is out",
+])
+def test_review3_ordinary_sentences_survive(text):
+    assert scrub(text) == text
+
+
+def test_only_the_credential_sentence_goes():
+    assert scrub("I live in Fitzroy. My PIN is 4821. I like jazz.") == \
+        "I live in Fitzroy. [secret removed] I like jazz."
+
+
+@pytest.mark.parametrize("text", [
+    "a-" * 20000 + "token=abc", "foo.bar." * 5000 + " password: x",
+    "a-b-c-d-e-f-g-" * 3000 + "\n", "x" * 40000,
+], ids=["hyphens", "dots", "letters-and-hyphens", "one-long-word"])  # short ids: Windows caps an env var at 32,767
+def test_long_runs_of_word_characters_are_quick(text):
+    # review 2026-10-12 (3.16): an 8 KB run of "a-" took 8 s; scrub() runs
+    # on every stored turn, and pasted logs and lockfiles are long
+    import time
+    t = time.time()
+    scrub(text)
+    assert time.time() - t < 3
+
+
+def test_a_long_identifier_before_the_assignment_is_still_caught():
+    out = scrub("x" * 80 + ".DB_PASSWORD=hunter2abc")
+    assert "hunter2" not in out
+
+
+@pytest.mark.parametrize("text, secret", [
+    # review 2026-10-12 (3.17): credentials that got through
+    ("my password is\nhunter2", "hunter2"), ("The password\nhunter2xyz", "hunter2xyz"),
+    ("The password\ncorrect horse battery staple", "battery"),
+    ("my pass is hunter2", "hunter2"), ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpw"),
+    ("Passwort: geheim123", "geheim123"), ("mot de passe: soleil42", "soleil42"),
+    ("contraseña: sol123", "sol123"), ("key=AbC123dEf456", "AbC123dEf456"),
+    ("-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----", "lQOYBF"),
+])
+def test_review_2026_10_12_leaks_are_closed(text, secret):
+    assert secret not in scrub(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Never reuse a password\nacross sites.", "pass is ~20 min at n_jobs=8",
+    "my bus pass is valid", "primary key: id", "key=value",
+    "Remember the password\nIt was on a sticky note in the kitchen drawer",
+])
+def test_review_2026_10_12_ordinary_text_survives(text):
+    assert scrub(text) == text
+
+
+def test_a_title_is_scrubbed_before_it_is_cut():
+    # review 2026-10-12 (3.6): the hook cut the title at 60 characters first,
+    # leaving a key too short to recognise
+    from sourcedrecall.importers import _scrubbed
+    text = "please use this key for the staging box sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 thanks"
+    assert "sk-proj" not in _scrubbed(text)[:60]
+    assert "abcdefghij" not in _scrubbed(text)[:60]
+
+
+def test_many_key_headers_without_an_end_are_fast_and_removed():
+    # 2026-10-21 (review): quadratic before (336 KB took 11 s)
+    import time
+    text = "-----BEGIN PRIVATE KEY-----\n" * 12000
+    t0 = time.time()
+    out = scrub("my notes\n" + text)
+    assert time.time() - t0 < 2 and "BEGIN" not in out and out.startswith("my notes")
+
+
+def test_a_key_block_between_text_is_removed_and_the_text_kept():
+    out = scrub("before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\nafter")
+    assert "MIIEow" not in out and "before" in out and "after" in out
+
+
+# 2026-10-28 (review M8)
+@pytest.mark.parametrize("text", [
+    "psql --password hunter2xy -h db", "run it with --token=abc123def",
+    "deploy --api-key sk9f8e7d6c", "connect to admin:s3cretpw@db.example.com",
+    "the webhook secret is whsec_AbCdEfGhIjKlMnOpQr", "mypassword is hunter2",
+])
+def test_more_credential_shapes_are_removed(text):
+    from sourcedrecall.secrets import scrub
+    assert "[secret removed]" in scrub(text)
+
+
+@pytest.mark.parametrize("text", [
+    "docker run -p 8080:80 nginx", "git clone git@github.com:org/repo.git",
+    "email me at dana@example.com", "the meeting is at 10:30 tomorrow",
+    "use --password-file instead of a flag",
+])
+def test_shapes_like_them_are_kept(text):
+    from sourcedrecall.secrets import scrub
+    assert scrub(text) == text
+
+
+# 2026-11-11 (review): the long-token rule removed names a coding session is
+# full of; a random token of the same length still goes
+@pytest.mark.parametrize("name", [
+    "claude-sonnet-4-5-20250929",
+    "gpt-4o-mini-2024-07-18",
+    "550e8400-e29b-41d4-a716-446655440000",
+    "7a83a79f1c2e4b5d6a7b8c9d0e1f2a3b4c5d6e7f",
+    "qwen3-14b-instruct-2507-q4",
+])
+def test_model_ids_uuids_and_commit_hashes_are_kept(name):
+    assert scrub(f"We ran it with {name} last night.") == f"We ran it with {name} last night."
+
+
+def test_a_random_token_is_still_removed():
+    assert MARK in scrub("the key is x9Kq2LmZ7vRt4WbN8cYp3HdF6sJa")

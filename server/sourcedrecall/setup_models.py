@@ -1,0 +1,290 @@
+"""One-time model download for sourcedrecall.
+
+    sourcedrecall-setup
+
+The server runs OFFLINE: it sets HF_HUB_OFFLINE=1 at import, and the parser
+never fetches anything at runtime. That is the privacy property -- nothing
+leaves the machine -- but it also means a fresh install has no models until
+something downloads them. This is that something: the ONLY place network
+access is allowed, run once, explicitly, and it says what it fetched, how
+big it is and where it went.
+
+2026-10-02: written after reading the README against a genuinely fresh
+machine. The first README rewrite claimed the models "download on first
+use"; with offline mode forced, they never would have.
+"""
+import os
+import sys
+import time
+
+# Network allowed for THIS process only, and before any HF import reads it.
+os.environ["SOURCEDRECALL_SETUP"] = "1"   # paths.py leaves offline mode off
+os.environ["HF_HUB_OFFLINE"] = "0"
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
+# (what, size guide, loader) -- every model the server can load
+STANZA_PROCESSORS = "tokenize,pos,lemma,depparse"   # rgx's pipeline
+# 2026-10-02: each model's official ONNX export, stored with fp16 weights
+# (core/ort_models.py): half the disk, identical results, and no
+# transformers / sentence-transformers.
+HF_MODELS = [
+    ("retrieval embedder", "BAAI/bge-small-en-v1.5"),
+    ("retrieval re-ranker", "cross-encoder/ms-marco-MiniLM-L6-v2"),
+    ("conflict checker (NLI)", "cross-encoder/nli-deberta-v3-xsmall"),
+]
+from sourcedrecall._bridge import code_roots as _code_roots
+_P2 = _code_roots()[1]
+
+
+# 2026-10-05: the PyTorch-free parser, converted by tools/stanza_ort/convert.py
+# and packed as a .tar.gz (tools/stanza_ort/pack.py).
+# SOURCEDRECALL_PARSER_ARCHIVE names another archive (path or URL) to install.
+# (2026-10-12, review 4.2: at a fixed commit, so a re-upload cannot break installs)
+# 2026-10-15: the EWT-only parser (tools/stanza_ort/train_ewt.sh; trained on
+# UD English-EWT alone, CC BY-SA 4.0), replacing Stanza's combined models
+PARSER_ARCHIVE = ("https://huggingface.co/synthiumjp/sourcedrecall-parser-en/resolve/"
+                  "980effa58361092956077e88c9f1a9ceeddde482/"
+                  "sourcedrecall-parser-en-ewt.tar.gz")
+PARSER_SHA256 = "3cde3a9b29b6da81e72ad3208874fcdbb1961df82130829d3b8f7dd01ef362b1"
+
+
+# 2026-10-07: the optional in-process notes models (notes.py), Qwen3 trained
+# to write the user's lasting facts, int4 ONNX for onnxruntime-genai
+# (tools/distil, MODEL_CARD_notes.md). LoCoMo test 68.2% (small) and 70.3%
+# (standard) against 64.7% without notes. SOURCEDRECALL_NOTES_ARCHIVE
+# overrides with a path or URL.
+_HF_NOTES = ("https://huggingface.co/synthiumjp/sourcedrecall-notes-en/resolve/"
+             "dc3e9a93d4fa792cbfe575a0524f82abdb1a3d10/")
+NOTES_MODELS = {
+    "small": (_HF_NOTES + "sourcedrecall-notes-en-0.6b.tar.gz",
+              "db1b22779c3502665546780c91c5a8f3a1380f6e99570c05d3811e44b0c3d21e",
+              "~0.5 GB, 2-3 s a conversation"),
+    "standard": (_HF_NOTES + "sourcedrecall-notes-en-1.7b.tar.gz",
+                 "0202bbb89468ee44fc397af37df1628dc55b7b46a414bb09b549101634ce5d91",
+                 "~1.4 GB, about 4.5 s a conversation"),
+}
+
+
+def install_parser_archive(src, sha256=None):
+    """Download (if a URL) or copy the parser model archive, check its
+    sha256 when one is given, and unpack it into paths.parser_models_dir()."""
+    from sourcedrecall.paths import parser_models_dir
+    return install_archive(src, sha256, parser_models_dir(), "config.json", "parser")
+
+
+def install_archive(src, sha256, dest, marker, what):
+    """The same for any model archive whose top folder holds `marker`."""
+    import hashlib
+    import shutil
+    import tarfile
+    import tempfile
+    import urllib.request
+    tmp = tempfile.mkdtemp(prefix=f"sourcedrecall-{what}-")
+    try:
+        path = os.path.join(tmp, "models.tar.gz")
+        if src.startswith(("http://", "https://")):
+            # 2026-10-12 (review 4.2, launch review): progress, and a broken
+            # download resumes where it stopped (the partial file is kept
+            # beside the destination until it is complete and checked)
+            path = dest.rstrip("/\\") + ".download"
+            _download(src, path, what)
+        else:
+            shutil.copyfile(src, path)
+        if sha256:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            if h.hexdigest() != sha256.lower():
+                if path.endswith(".download"):
+                    os.unlink(path)          # a corrupt partial must not be resumed
+                raise RuntimeError(f"{what} model archive: sha256 does not match")
+        out = os.path.join(tmp, "out")
+        with tarfile.open(path) as t:
+            for m in t.getmembers():
+                if m.name.startswith(("/", "..")) or ".." in m.name.split("/"):
+                    raise RuntimeError(f"{what} model archive: unsafe path " + m.name)
+            try:
+                t.extractall(out, filter="data")      # Python 3.12+: no links out, no odd modes
+            except TypeError:
+                # 2026-10-09 (security review): older Pythons have no filter;
+                # only plain files and folders are accepted there
+                bad = [m.name for m in t.getmembers() if not (m.isfile() or m.isdir())]
+                if bad:
+                    raise RuntimeError(f"{what} model archive: unexpected member {bad[0]}")
+                t.extractall(out)
+        # the archive holds the marker file at its top or in one folder
+        top = out
+        if not os.path.exists(os.path.join(top, marker)):
+            subs = [os.path.join(out, x) for x in os.listdir(out)]
+            top = next((x for x in subs if os.path.exists(os.path.join(x, marker))), None)
+            if top is None:
+                raise RuntimeError(f"{what} model archive: no {marker}")
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(top, dest)
+        if path.endswith(".download"):
+            os.unlink(path)
+        return dest
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _download(url, path, what):
+    """Fetch url into path, continuing a partial file with an HTTP Range
+    request, printing progress every 10%. A stalled connection fails after
+    60 s; run setup again to continue."""
+    import urllib.error
+    import urllib.request
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    have = os.path.getsize(path) if os.path.exists(path) else 0
+    req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+    try:
+        r = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have:           # already complete
+            return
+        raise
+    with r:
+        if have and r.status != 206:         # the server ignored Range: start over
+            have = 0
+        total = r.headers.get("Content-Length")
+        total = int(total) + have if total and total.isdigit() else None
+        mode = "ab" if have else "wb"
+        step = 10
+        with open(path, mode) as f:
+            got = have
+            if have and total:
+                print(f"      resuming {what} download at {got * 100 // total}%", flush=True)
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                if total and got * 100 // total >= step:
+                    print(f"      {what}: {got * 100 // total}% of {total >> 20} MB", flush=True)
+                    step = (got * 100 // total) // 10 * 10 + 10
+
+
+def _du(path):
+    """Bytes actually on disk. Skips symlinks: the HF cache links every
+    snapshot file to a blob, and following both reported 2.8 GB for an
+    0.9 GB cache (second new-user test)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            fp = os.path.join(root, f)
+            if os.path.islink(fp):
+                continue
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
+def _mb(n):
+    return f"{n / 1e6:,.0f} MB"
+
+
+def install_notes(tier="small"):
+    """`sourcedrecall-setup --notes [small|standard]`: install a notes model,
+    which turns notes on (needs pip install 'sourcedrecall[notes]')."""
+    if tier not in NOTES_MODELS:
+        print(f"Unknown notes model '{tier}': small or standard.")
+        return 1
+    import importlib.util
+    if not importlib.util.find_spec("onnxruntime_genai"):
+        print("Notes need onnxruntime-genai: pip install 'sourcedrecall[notes]'")
+        return 1
+    url, sha, size = NOTES_MODELS[tier]
+    src = os.environ.get("SOURCEDRECALL_NOTES_ARCHIVE") or url
+    from sourcedrecall.paths import notes_models_dir
+    sha = (os.environ.get("SOURCEDRECALL_NOTES_SHA256")
+           or (sha if src == url else None))
+    print(f"Notes model, {tier} (writes short notes of what you said, in this "
+          f"process, no server) -- {size}", flush=True)
+    d = install_archive(src, sha, notes_models_dir(), "genai_config.json", "notes")
+    print(f"      -> {d} ({_mb(_du(d))})\nNotes are on. To turn them off: "
+          "SOURCEDRECALL_NOTES=off, or delete that folder. For conversations "
+          "stored before now: sourcedrecall-memory notes-backfill")
+    return 0
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if "--notes" in argv:
+        i = argv.index("--notes")
+        tier = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("-") else "small"
+        return install_notes(tier)
+    t0 = time.time()
+    print("sourcedrecall setup: downloading the models the server uses.\n"
+          "This is the only step that touches the network.\n")
+
+    archive = os.environ.get("SOURCEDRECALL_PARSER_ARCHIVE") or PARSER_ARCHIVE
+    done = False
+    if archive and os.environ.get("RGX_PARSER", "").lower() != "stanza":
+        print(f"[1/{1 + len(HF_MODELS)}] English parser (trained on UD English-EWT, "
+              "on ONNX Runtime, no PyTorch) -- ~160 MB, the slowest step", flush=True)
+        try:
+            sha = (os.environ.get("SOURCEDRECALL_PARSER_SHA256")
+                   or (PARSER_SHA256 if archive == PARSER_ARCHIVE else None))
+            d = install_parser_archive(archive, sha)
+            print(f"      -> {d} ({_mb(_du(d))})")
+            done = True
+        except Exception as e:
+            print(f"      -> could not install ({e}); trying Stanza with PyTorch")
+    if not done:
+        try:
+            import stanza  # noqa: F401
+        except ImportError:
+            print("\nThe parser models could not be installed, and Stanza with "
+                  "PyTorch (the fallback) is not installed either. Check the "
+                  "network and run sourcedrecall-setup again, or install the "
+                  "fallback: pip install 'sourcedrecall[stanza]' (on Linux, "
+                  "first: pip install torch --index-url "
+                  "https://download.pytorch.org/whl/cpu).")
+            return 1
+        print(f"[1/{1 + len(HF_MODELS)}] English parser (Stanza: {STANZA_PROCESSORS})"
+              " -- ~320 MB, the slowest step", flush=True)
+        import stanza
+        stanza.download("en", processors=STANZA_PROCESSORS)
+        from stanza.resources.common import DEFAULT_MODEL_DIR
+        sdir = os.environ.get("STANZA_RESOURCES_DIR", DEFAULT_MODEL_DIR)
+        print(f"      -> {sdir} ({_mb(_du(sdir))})")
+
+    if _P2 not in sys.path:
+        sys.path.insert(0, _P2)
+    import ort_models
+    for i, (what, name) in enumerate(HF_MODELS, start=2):
+        print(f"[{i}/{1 + len(HF_MODELS)}] {what}: {name}", flush=True)
+        ort_models.ensure(name)
+        # 2026-10-13: the fp32 copy each session loads from disk (ort_models._fp32_path;
+        # converting at every start kept ~800 MB resident)
+        ort_models._fp32_path(ort_models.model_dir(name))
+    # Size of THESE models only
+    ours = sum(_du(ort_models.model_dir(name)) for _w, name in HF_MODELS)
+    root = os.path.dirname(ort_models.model_dir(HF_MODELS[0][1]))
+    print(f"      -> {root} ({_mb(ours)} for these {len(HF_MODELS)} models)")
+
+    # WordNet: what TYPE of thing a question asks for (tea is a beverage,
+    # Leeds is a city). Optional -- without it those checks are skipped.
+    print("[+] WordNet (answer types) -- ~11 MB", flush=True)
+    try:
+        import nltk
+        if nltk.download("wordnet", quiet=True) is False:
+            print("      -> not downloaded; answer types off")
+        else:
+            print("      -> done")
+    except Exception as e:
+        print(f"      -> skipped ({e.__class__.__name__}); answer types off")
+
+    print(f"\nDone in {time.time() - t0:.0f} s. The server will now run fully "
+          "offline.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
