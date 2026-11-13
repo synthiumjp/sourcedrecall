@@ -7,6 +7,13 @@ Claude Code's own memory is notes Claude writes for itself; sourcedrecall
 keeps the source those notes are written from, and marks what has gone out
 of date.
 
+It is for the moments when that record matters. A bug comes back weeks
+later and Claude debugs it from scratch, retrying what already failed. Claude
+suggests undoing something you decided on purpose, because the reason never
+reached its notes. You come back after a few days, a `/clear` or a
+compaction, and spend the first ten minutes explaining where you were. The
+answer was in the old sessions; sourcedrecall makes it findable.
+
 No language model writes the memory or searches it. A grammar parser decides
 what is stored and what a later message replaced, and small models on your
 CPU (the parser's, a search embedder and re-ranker, a contradiction check and
