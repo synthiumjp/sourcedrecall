@@ -7,12 +7,14 @@ Claude Code's own memory is notes Claude writes for itself; sourcedrecall
 keeps the source those notes are written from, and marks what has gone out
 of date.
 
-No language model writes or reads the memory. A grammar parser decides what
-is stored and what a later message replaced, and small models on your CPU
-(the parser's, a search embedder and re-ranker, a contradiction check and a
-pasted-text classifier) find the right messages. It works with any model
+No language model writes the memory or searches it. A grammar parser decides
+what is stored and what a later message replaced, and small models on your
+CPU (the parser's, a search embedder and re-ranker, a contradiction check and
+a pasted-text classifier) find the right messages. It works with any model
 your agent uses and needs no API key. The memory is a folder of plain files
-on your machine.
+on your machine. Your agent's model reads what a search returns, like any
+tool output: up to about 3,000 tokens a search, and a session-start summary
+of at most about 2,400 tokens.
 
 ```
 $ sourcedrecall-memory context "Where do I live?"
