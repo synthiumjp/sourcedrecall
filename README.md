@@ -130,11 +130,13 @@ should be able to use the tools, but none has been tried: see
 model:
 
 ```bash
-git clone https://github.com/synthiumjp/sourcedrecall && cd sourcedrecall
-pip install -e ./server && sourcedrecall-setup
+pip install sourcedrecall && sourcedrecall-setup
 sourcedrecall-memory ingest chat.jsonl
 sourcedrecall-memory context "Where do I live?"
 ```
+
+From a clone instead: `git clone https://github.com/synthiumjp/sourcedrecall`,
+then `pip install -e ./server && sourcedrecall-setup`.
 
 Needs Python 3.10 to 3.13. The install takes a few minutes and about 1.3 GB
 of disk (0.7 GB of it models); no PyTorch. After setup it runs offline.

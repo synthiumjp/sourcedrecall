@@ -116,6 +116,21 @@ find_python() {   # prints a Python 3.10-3.13, or fails
   [ -n "$py" ] && printf '%s\n' "$py"
 }
 
+# The source at $REF, cloned or updated in $SRC. 2026-11-13: an existing
+# clone kept the address it was made from, so a changed
+# SOURCEDRECALL_REPO_URL (or the default after a local one) was never used.
+fetch_src() {
+  if [ -d "$SRC/.git" ]; then
+    [ "$(git -C "$SRC" remote get-url origin 2>/dev/null)" = "$REPO_URL" ] ||
+      git -C "$SRC" remote set-url origin "$REPO_URL" || return 1
+    git -C "$SRC" fetch --depth 1 origin "refs/tags/$REF:refs/tags/$REF" 2>/dev/null ||
+      git -C "$SRC" fetch --depth 1 origin "$REF" || return 1
+    git -C "$SRC" checkout -q "$REF" 2>/dev/null || git -C "$SRC" checkout -q FETCH_HEAD || return 1
+  else
+    git clone -q --depth 1 --branch "$REF" "$REPO_URL" "$SRC" || return 1
+  fi
+}
+
 do_install() {
   mkdir -p "$DATA"
   echo "== sourcedrecall install $REF $(date)"
@@ -128,13 +143,7 @@ do_install() {
   local py
   py="$(find_python)" || { echo "Python 3.10 to 3.13 is required (macOS: brew install python@3.12; Windows: python.org or winget install Python.Python.3.12)"; return 1; }
   echo "using $py"
-  if [ -d "$SRC/.git" ]; then
-    git -C "$SRC" fetch --depth 1 origin "refs/tags/$REF:refs/tags/$REF" 2>/dev/null ||
-      git -C "$SRC" fetch --depth 1 origin "$REF" || return 1
-    git -C "$SRC" checkout -q "$REF" 2>/dev/null || git -C "$SRC" checkout -q FETCH_HEAD || return 1
-  else
-    git clone -q --depth 1 --branch "$REF" "$REPO_URL" "$SRC" || return 1
-  fi
+  fetch_src || return 1
   # 2026-10-21 (review): Debian and Ubuntu leave a venv without pip when
   # python3-venv is missing, and the next try then skipped making it
   if [ -x "$VBIN/python$EXE" ] && ! "$VBIN/python$EXE" -m pip --version >/dev/null 2>&1; then
@@ -202,6 +211,10 @@ start_background_install() {
 }
 
 case "${1:-}" in
+  _fetch-src)       # the source step alone (tests)
+    mkdir -p "$DATA" && fetch_src
+    exit $?
+    ;;
   install)
     do_install >>"$LOG" 2>&1
     rc=$?

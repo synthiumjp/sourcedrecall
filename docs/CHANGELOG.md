@@ -3,6 +3,14 @@
 Numbers are from the benchmarks in `bench/` (same local reader and judge for
 every system; see `bench/REPRODUCE.md`).
 
+## 0.6.1
+
+- An existing install follows a changed repository address
+  (`SOURCEDRECALL_REPO_URL`, or the default after a local one); it kept
+  fetching from where it was first cloned.
+- The plugin's description names the slash command as `/sourcedrecall:recall`.
+- The READMEs install from PyPI (`pip install sourcedrecall`).
+
 ## 0.6.0
 
 - The MCP tools are named `memory_recall`, `memory_context`, `memory_check`,

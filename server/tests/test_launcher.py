@@ -84,3 +84,35 @@ def test_messages_name_the_command_the_user_can_run(monkeypatch):
     assert command("memory show") == "! sourcedrecall-run memory show"
     monkeypatch.delenv("CLAUDE_PLUGIN_ROOT")
     assert command("memory show") == "sourcedrecall-memory show"
+
+
+def _repo(path, tag, text):
+    path.mkdir(parents=True)
+    g = lambda *a: subprocess.run(["git", "-C", str(path), *a], check=True,  # noqa: E731
+                                  capture_output=True)
+    g("init", "-q", "-b", "main")
+    (path / "f.txt").write_text(text)
+    g("add", "f.txt")
+    g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", text)
+    g("tag", tag)
+    return str(path)
+
+
+def test_an_install_follows_a_changed_repository_address(tmp_path):
+    # 2026-11-13 (launch): an install cloned from a local checkout kept
+    # fetching from it after the address went back to the public repository,
+    # which has the release tag the local one lacks
+    if not shutil.which("git"):
+        pytest.skip("git is not installed")
+    old = _repo(tmp_path / "old", "v-old", "old")
+    new = _repo(tmp_path / "new", "v-new", "new")
+    assert _run(["_fetch-src"], tmp_path, SOURCEDRECALL_REPO_URL=old,
+                SOURCEDRECALL_REF="v-old").returncode == 0
+    src = tmp_path / "data" / "src"
+    assert (src / "f.txt").read_text() == "old"
+    out = _run(["_fetch-src"], tmp_path, SOURCEDRECALL_REPO_URL=new, SOURCEDRECALL_REF="v-new")
+    assert out.returncode == 0, out.stderr
+    assert (src / "f.txt").read_text() == "new"
+    url = subprocess.run(["git", "-C", str(src), "remote", "get-url", "origin"],
+                         capture_output=True, text=True).stdout.strip()
+    assert url == new

@@ -43,13 +43,13 @@ be able to use the server; if you try one, an issue saying whether it worked
 is welcome.
 
 ```bash
-git clone <this repo> rg && cd rg
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e ./server
+pip install sourcedrecall
 ```
 
-Use `-e` (editable): the server loads its memory code from this checkout.
-Then download the models, once:
+From a clone instead (`git clone https://github.com/synthiumjp/sourcedrecall`),
+use `pip install -e ./server`: editable, as the server then loads its memory
+code from the checkout. Then download the models, once:
 
 ```bash
 sourcedrecall-setup
